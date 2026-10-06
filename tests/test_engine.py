@@ -99,12 +99,12 @@ def main():
     m.update_task(t7.id, connections=2, save_dir=tmp + "/pindah", filename="baru.bin")
     time.sleep(1.5); cfg["speed_limit_kbps"] = 0; m.apply_settings()
     assert wait(m, t7.id, "completed"), (t7.status, t7.error)
-    assert t7.final_path == tmp + "/pindah/baru.bin" and sha(t7.final_path) == SHA and t7.connections == 2
+    assert os.path.normpath(t7.final_path) == os.path.normpath(tmp + "/pindah/baru.bin") and sha(t7.final_path) == SHA and t7.connections == 2
     assert not os.path.exists(tmp + "/dl/Lainnya/mv.bin.part")
     print("OK ubah koneksi+lokasi+nama saat berjalan:", t7.final_path)
 
     m.update_task(t.id, save_dir=tmp + "/arsip", filename="dipindah.bin"); time.sleep(0.8)
-    assert t.final_path == tmp + "/arsip/dipindah.bin" and os.path.exists(t.final_path) and t.status == "completed"
+    assert os.path.normpath(t.final_path) == os.path.normpath(tmp + "/arsip/dipindah.bin") and os.path.exists(t.final_path) and t.status == "completed"
     print("OK pindahkan file yang sudah selesai")
 
     from swiftget.engine import build_format
