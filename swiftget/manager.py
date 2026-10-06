@@ -1,0 +1,313 @@
+"""Manajer antrean: jadwal, prioritas, jeda/lanjut, dan penyimpanan riwayat."""
+from __future__ import annotations
+import os, shutil, threading, time
+from collections import deque
+from pathlib import Path
+
+from .config import OTHER, categorize
+from .engine import FileJob, MediaJob, RateLimiter, clean_error
+from .models import ACTIVE, DB, Task
+from .util import sanitize, unique_name
+
+
+class Manager:
+    def __init__(self, cfg, db: DB):
+        self.cfg, self.db = cfg, db
+        self.lock = threading.RLock()
+        self.tasks: dict[int, Task] = {}
+        self.jobs: dict[int, object] = {}
+        self.threads: dict[int, threading.Thread] = {}
+        self.reserved: set = set()
+        self.limiter = RateLimiter()
+        self.on_event = None          # callback(kind, task_id)
+        self.speed = 0.0
+        self.speed_hist = deque([0.0] * 60, maxlen=60)
+        self._was_busy = False
+        self._running = True
+        self.apply_settings()
+        for t in db.load_all():
+            if t.status in ACTIVE:
+                t.status = "paused"
+            self.tasks[t.id] = t
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    # ---------------------------------------------------------------- setup
+    def apply_settings(self):
+        self.limiter.set_rate(int(self.cfg["speed_limit_kbps"]) * 1024)
+
+    def default_dir(self, category: str) -> str:
+        base = Path(self.cfg["download_dir"])
+        return str(base / category) if self.cfg["auto_categorize"] and category else str(base)
+
+    def assign_name(self, t: Task, name: str):
+        """Tetapkan nama file unik + kategori + folder untuk tugas."""
+        with self.lock:
+            name = sanitize(name)
+            if t.auto_dir:
+                t.category = categorize(name)
+                t.save_dir = self.default_dir(t.category)
+            os.makedirs(t.save_dir, exist_ok=True)
+            t.filename = unique_name(t.save_dir, name, self.reserved)
+            self.reserved.add((t.save_dir, t.filename))
+
+    # ------------------------------------------------------------------ API
+    def add(self, url, *, kind="file", filename="", save_dir=None, connections=None, referer="", cookies="",
+            user_agent="", headers=None, media_opts=None, start=True, start_at=0.0, checksum="", title="") -> Task:
+        t = Task(url=url.strip(), kind=kind, referer=referer, cookies=cookies, user_agent=user_agent,
+                 headers=headers or {}, media_opts=media_opts or {}, checksum=checksum.strip(), title=title,
+                 connections=int(connections or self.cfg["connections"]), start_at=start_at)
+        if kind == "media":
+            t.category = "Musik" if t.media_opts.get("mode") == "audio" else "Video"
+        elif filename:
+            t.filename = sanitize(filename)
+            t.category = categorize(t.filename)
+        else:
+            t.category = OTHER
+        t.auto_dir = not save_dir
+        t.save_dir = save_dir or self.default_dir(t.category)
+        t.status = "scheduled" if start_at > time.time() else ("queued" if start else "paused")
+        with self.lock:
+            self.db.insert(t)
+            t.order = float(t.id)
+            if t.filename and kind == "file":
+                t.filename = unique_name(t.save_dir, t.filename, self.reserved)
+                self.reserved.add((t.save_dir, t.filename))
+            self.tasks[t.id] = t
+            self.db.update(t)
+        return t
+
+    def pause(self, tid):
+        with self.lock:
+            t = self.tasks.get(tid)
+            if t and (t.status in ACTIVE or t.status in ("queued", "scheduled")):
+                job = self.jobs.get(tid)
+                if job:
+                    job.request_stop("pause")
+                t.status, t.speed, t.eta = "paused", 0, -1
+                self.db.update(t)
+
+    def resume(self, tid):
+        with self.lock:
+            t = self.tasks.get(tid)
+            if t and t.status in ("paused", "error", "scheduled"):
+                t.status, t.error, t.start_at = "queued", "", 0
+                self.db.update(t)
+
+    def update_task(self, tid, *, connections=None, save_dir=None, filename=None, media_opts=None, resume=True):
+        """Ubah koneksi / lokasi / nama. Unduhan aktif dijeda sebentar, diubah, lalu dilanjutkan."""
+        with self.lock:
+            t = self.tasks.get(tid)
+            if not t:
+                return
+            job, th = self.jobs.get(tid), self.threads.get(tid)
+            was_running = t.status in ACTIVE or t.status in ("queued", "scheduled")
+            if job:
+                job.request_stop("pause")
+            if was_running:
+                t.status, t.speed, t.eta = "paused", 0, -1
+
+        def apply():
+            if th:
+                th.join(15)
+            with self.lock:
+                if connections:
+                    t.connections = max(1, min(32, int(connections)))
+                if media_opts and t.kind == "media" and t.status != "completed":
+                    t.media_opts = dict(media_opts)
+                    cat = "Musik" if media_opts.get("mode") == "audio" else "Video"
+                    if t.auto_dir and not save_dir and cat != t.category:
+                        t.save_dir = self.default_dir(cat)
+                    t.category = cat
+                    t.downloaded = t.total = 0
+                    t.final_path = ""
+                try:
+                    self._relocate(t, save_dir, filename)
+                    if save_dir:
+                        t.auto_dir = False
+                    if resume and t.status != "completed" and (was_running or t.status in ("error", "paused")):
+                        t.status, t.error = "queued", ""
+                except OSError as e:
+                    t.status, t.error = "error", f"Gagal memindahkan file: {e}"
+                self.db.update(t)
+        threading.Thread(target=apply, daemon=True).start()
+
+    def _relocate(self, t: Task, new_dir, new_name):
+        old_dir, new_dir = t.save_dir, (new_dir or t.save_dir)
+        if t.kind == "file":
+            old_name = t.filename
+            name = sanitize(new_name) if new_name else old_name
+            if not old_name:                      # belum bernama: cukup ganti folder
+                t.save_dir = new_dir
+                if name:
+                    t.filename = unique_name(new_dir, name, self.reserved)
+                return
+            if (new_dir, name) == (old_dir, old_name):
+                return
+            os.makedirs(new_dir, exist_ok=True)
+            name = unique_name(new_dir, name, self.reserved)
+            if t.status == "completed":
+                src = t.final_path or os.path.join(old_dir, old_name)
+                if os.path.exists(src):
+                    dst = os.path.join(new_dir, name)
+                    shutil.move(src, dst)
+                    t.final_path = dst
+            else:
+                src = os.path.join(old_dir, old_name + ".part")
+                if os.path.exists(src):
+                    shutil.move(src, os.path.join(new_dir, name + ".part"))
+            self.reserved.discard((old_dir, old_name))
+            self.reserved.add((new_dir, name))
+            t.save_dir, t.filename = new_dir, name
+        else:                                     # media (yt-dlp)
+            t.save_dir = new_dir
+            fp = t.final_path
+            if t.status == "completed" and fp and os.path.exists(fp):
+                base = os.path.basename(fp.rstrip("/\\"))
+                if new_name and os.path.isfile(fp):
+                    base = sanitize(new_name)
+                dst = os.path.join(new_dir, base)
+                if os.path.abspath(dst) != os.path.abspath(fp):
+                    os.makedirs(new_dir, exist_ok=True)
+                    shutil.move(fp, dst)
+                    t.final_path, t.filename = dst, base
+
+    def retry(self, tid):
+        self.resume(tid)
+
+    def redownload(self, tid):
+        with self.lock:
+            t = self.tasks.get(tid)
+            if not t or tid in self.jobs:
+                return
+            self._wipe_files(t, final=True)
+            t.chunks, t.downloaded, t.total, t.final_path = [], 0, 0, ""
+            if t.kind == "file":
+                t.filename = ""
+            t.status, t.error = "queued", ""
+            self.db.update(t)
+
+    def remove(self, tid, delete_file=False):
+        with self.lock:
+            t = self.tasks.pop(tid, None)
+            job = self.jobs.get(tid)
+            th = self.threads.get(tid)
+        if not t:
+            return
+        if job:
+            job.request_stop("cancel")
+        self.db.delete(tid)
+
+        def cleanup():
+            if th:
+                th.join(8)
+            self._wipe_files(t, final=delete_file)
+        threading.Thread(target=cleanup, daemon=True).start()
+
+    def _wipe_files(self, t: Task, final: bool):
+        try:
+            if t.kind == "file" and t.filename:
+                part = os.path.join(t.save_dir, t.filename + ".part")
+                if os.path.exists(part):
+                    os.remove(part)
+                self.reserved.discard((t.save_dir, t.filename))
+            if final and t.final_path and os.path.isfile(t.final_path):
+                os.remove(t.final_path)
+        except OSError:
+            pass
+
+    def clear_finished(self):
+        for t in [t for t in self.tasks.values() if t.status == "completed"]:
+            self.remove(t.id)
+
+    def start_all(self):
+        for t in list(self.tasks.values()):
+            if t.status in ("paused", "error"):
+                self.resume(t.id)
+
+    def pause_all(self):
+        for t in list(self.tasks.values()):
+            self.pause(t.id)
+
+    def move(self, tid, delta):
+        with self.lock:
+            ordered = sorted((t for t in self.tasks.values() if t.status != "completed"), key=lambda t: t.order)
+            ids = [t.id for t in ordered]
+            if tid not in ids:
+                return
+            i, j = ids.index(tid), ids.index(tid) + delta
+            if 0 <= j < len(ids):
+                a, b = self.tasks[ids[i]], self.tasks[ids[j]]
+                a.order, b.order = b.order, a.order
+                self.db.update(a)
+                self.db.update(b)
+
+    def shutdown(self):
+        self._running = False
+        for t in list(self.tasks.values()):
+            self.pause(t.id)
+        for th in list(self.threads.values()):
+            th.join(5)
+        for t in self.tasks.values():
+            self.db.update(t)
+
+    # ----------------------------------------------------------------- loop
+    def _emit(self, kind, tid=0):
+        if self.on_event:
+            try:
+                self.on_event(kind, tid)
+            except Exception:
+                pass
+
+    def _start(self, t: Task):
+        job = (MediaJob if t.kind == "media" else FileJob)(t, self.cfg, self.limiter, self)
+        t.status = "preparing"
+        self.jobs[t.id] = job
+        th = threading.Thread(target=self._run, args=(t, job), daemon=True)
+        self.threads[t.id] = th
+        th.start()
+
+    def _run(self, t: Task, job):
+        try:
+            job.run()
+            if t.status == "completed":
+                self._emit("completed", t.id)
+        except Exception as e:
+            if job.reason not in ("pause", "cancel"):
+                t.status, t.error = "error", clean_error(e)
+                self._emit("error", t.id)
+        finally:
+            t.speed, t.eta = 0, -1
+            with self.lock:
+                self.jobs.pop(t.id, None)
+                self.threads.pop(t.id, None)
+                if t.status in ACTIVE:
+                    t.status = "paused"
+            if t.id in self.tasks:
+                self.db.update(t)
+
+    def _loop(self):
+        last_save = 0.0
+        while self._running:
+            now = time.time()
+            with self.lock:
+                for t in self.tasks.values():
+                    if t.status == "scheduled" and t.start_at <= now:
+                        t.status = "queued"
+                active = [t for t in self.tasks.values() if t.status in ACTIVE]
+                slots = int(self.cfg["max_concurrent"]) - len(active)
+                if slots > 0:
+                    queued = sorted((t for t in self.tasks.values() if t.status == "queued" and t.id not in self.jobs),
+                                    key=lambda t: t.order)
+                    for t in queued[:slots]:
+                        self._start(t)
+                self.speed = sum(t.speed for t in active)
+                busy = bool(active) or any(t.status == "queued" for t in self.tasks.values())
+            self.speed_hist.append(self.speed)
+            if self._was_busy and not busy:
+                self._emit("queue_done")
+            self._was_busy = busy
+            if now - last_save > 3:
+                last_save = now
+                for t in active:
+                    self.db.update(t)
+            time.sleep(0.5)

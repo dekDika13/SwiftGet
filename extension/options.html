@@ -1,0 +1,11 @@
+<!doctype html><html><head><meta charset="utf-8"><title>SwiftGet — Pengaturan</title><link rel="stylesheet" href="ui.css"></head>
+<body class="opts"><main>
+  <h1>SwiftGet Integration</h1>
+  <p class="muted">Salin token dari aplikasi SwiftGet: Pengaturan › Browser.</p>
+  <label>Token<input id="token" type="password" autocomplete="off"></label>
+  <label>Port<input id="port" type="number" min="1024" max="65535"></label>
+  <label class="chk"><input id="intercept" type="checkbox"> Ambil alih unduhan browser</label>
+  <label>Abaikan file lebih kecil dari (MB, 0 = semua)<input id="minSizeMB" type="number" min="0"></label>
+  <label>Domain yang dikecualikan (pisahkan dengan koma)<input id="excluded" placeholder="contoh: example.com, intranet.local"></label>
+  <div class="bar"><button id="save" class="primary">Simpan</button><button id="test">Tes koneksi</button><span id="msg" class="muted"></span></div>
+</main><script src="options.js"></script></body></html>
