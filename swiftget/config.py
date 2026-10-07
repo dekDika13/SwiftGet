@@ -4,7 +4,42 @@ import json, os, secrets, sys
 from pathlib import Path
 
 APP_NAME = "SwiftGet"
-APP_VERSION = "1.1.0"
+def _read_version() -> str:
+    """Versi dibaca dari pyproject.toml (satu-satunya sumber). Saat di-build, pyproject.toml ikut dibundel."""
+    import re
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    try:
+        m = re.search(r'^version\s*=\s*"([^"]+)"', (base / "pyproject.toml").read_text("utf-8"), re.M)
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    try:                                              # terpasang lewat "pip install ." tanpa pyproject.toml di sebelahnya
+        from importlib.metadata import version
+        return version("swiftget")
+    except Exception:
+        return "0.0.0"
+
+
+APP_VERSION = _read_version()
+
+# Isi dengan URL halaman toko setelah extension dipublikasikan, maka tombol "Pasang" langsung membuka toko (1 klik).
+EXT_STORE = {"chrome": "", "edge": "", "brave": "", "firefox": ""}
+
+
+def resource_dir() -> Path:
+    """Folder sumber daya (extension, aset): folder proyek, atau isi bundel saat sudah di-build."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent.parent
+
+
+def export_extension() -> Path:
+    """Salin extension ke folder yang mudah ditemukan (~/SwiftGet Extension) dan selalu disegarkan sesuai versi aplikasi."""
+    import shutil
+    src, dst = resource_dir() / "extension", Path.home() / "SwiftGet Extension"
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    return dst
 
 
 def data_dir() -> Path:
@@ -64,6 +99,9 @@ DEFAULTS = {
     "ffmpeg_path": "",
     "cookies_browser": "",
     "video_compat": True,      # True = H.264+AAC (bisa diputar di mana saja), False = kualitas asli VP9/AV1
+    "autostart": False,
+    "paired_origins": [],
+    "onboarded": False,
     "embed_metadata": True,
     "embed_thumbnail": False,
 }

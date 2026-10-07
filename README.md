@@ -15,6 +15,8 @@ Berjalan di macOS, Windows, dan Linux.
 **Mesin unduhan**
 - Multi-koneksi hingga 32 per file (file dipecah jadi *chunk*, ditarik paralel, dengan penyeimbangan beban otomatis)
 - Pause / lanjut, **resume bahkan setelah aplikasi ditutup**, deteksi file berubah di server (ETag/Last-Modified)
+- **Deteksi duplikat:** kalau URL/video yang sama sudah ada di daftar atau filenya sudah ada di disk, muncul dialog dengan pilihan
+  *simpan dengan nomor* (`Judul (1).mp4`), *ganti file lama* (timpa), *buka folder file sebelumnya*, atau batal. Berlaku untuk file biasa dan video.
 - Retry otomatis dengan jeda bertahap, pengecekan ruang disk, nama file unik otomatis (`file (1).zip`)
 - Batas kecepatan global, jumlah unduhan bersamaan, prioritas antrean (naik/turun)
 - Jadwal mulai (pilih tanggal & jam), verifikasi **checksum** (SHA-256 / SHA-1 / MD5)
@@ -56,8 +58,8 @@ Butuh **Python 3.10+** (disarankan 3.12).
 cd swiftget
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-python run.py
+pip install -r requirements.txt    # membaca pyproject.toml (sama dengan: pip install -e .)
+python run.py                      # atau: python -m swiftget  /  swiftget
 ```
 
 **FFmpeg** (untuk menggabung video+audio resolusi tinggi dan konversi MP3). **Tidak perlu Homebrew.** `pip install -r requirements.txt`
@@ -73,19 +75,24 @@ Tanpa FFmpeg video tetap bisa diunduh, tetapi hanya format gabungan (biasanya sa
 
 ## Memasang extension browser
 
-1. Di SwiftGet buka **Pengaturan › Browser**, klik **Salin** pada token.
-2. Pasang extension dari folder `extension/`:
+**Tersambung otomatis, tanpa salin-tempel token.** Cukup:
 
-| Browser | Langkah |
-|---|---|
-| **Chrome / Brave / Opera / Vivaldi** | buka `chrome://extensions` → aktifkan *Developer mode* → **Load unpacked** → pilih folder `extension` |
-| **Edge** | buka `edge://extensions` → *Developer mode* → **Load unpacked** |
-| **Firefox** | buka `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** → pilih `extension/manifest.json`. Lalu di *Add-ons Manager › SwiftGet › Permissions* izinkan akses ke semua situs. (Sifatnya sementara sampai extension ditandatangani lewat addons.mozilla.org.) |
-| **Safari** | tidak ada extension, lihat bagian fitur di atas |
+1. Buka **Pengaturan › Browser** dan klik tombol browsermu (Chrome, Edge, Brave, atau Firefox). SwiftGet menyiapkan folder
+   `~/SwiftGet Extension`, menyalin path-nya ke clipboard, dan membuka halaman extensions browser.
+2. Di halaman itu: aktifkan **Developer mode** → **Load unpacked** → pilih folder tadi. (Firefox: *Load Temporary Add-on* → `manifest.json`.)
+3. SwiftGet langsung menampilkan **"Izinkan extension terhubung?"**. Klik **Ya**. Selesai.
 
-3. Klik ikon SwiftGet → **Pengaturan**, tempel token, klik **Tes koneksi**. Harus muncul "Terhubung ✓".
+Saat pertama kali membuka SwiftGet, aplikasi juga menawarkan langkah ini. Tombol *Putuskan semua extension* di tab yang sama mencabut semua izin.
 
-Chrome mungkin menampilkan peringatan kuning soal `background.scripts` atau `browser_specific_settings`; itu normal, karena satu manifest dipakai untuk Chrome dan Firefox.
+**Pemasangan sekali klik** (tanpa Developer mode) hanya mungkin lewat toko resmi, karena Chrome/Edge memblokir pemasangan otomatis dari luar
+toko. Panduan menerbitkan ke Chrome Web Store, Edge Add-ons, dan Firefox Add-ons ada di [`STORE_PUBLISHING.md`](STORE_PUBLISHING.md).
+Begitu terbit, isi URL toko di `EXT_STORE` (`swiftget/config.py`) dan tombol di Pengaturan langsung membuka halaman toko.
+
+Agar extension selalu terhubung, aktifkan **Jalankan SwiftGet saat login** (Pengaturan › Umum; installer Windows juga menawarkannya).
+Bila SwiftGet tidak berjalan, unduhan otomatis dilanjutkan oleh browser seperti biasa.
+
+Chrome mungkin menampilkan peringatan kuning soal `background.scripts`; itu normal karena satu manifest dipakai untuk Chrome dan Firefox.
+Paket khusus toko (manifest bersih per browser) dibuat dengan `python packaging/pack_extension.py`.
 
 ---
 
@@ -133,7 +140,8 @@ SwiftGet memberi dua tingkat:
 ## Struktur proyek
 
 ```
-run.py                     titik masuk
+pyproject.toml             identitas proyek: versi, dependensi, entry point (sumber versi tunggal)
+run.py                     peluncur tipis (isi aplikasi ada di swiftget/app.py)
 swiftget/
   config.py                pengaturan, kategori
   engine.py                mesin multi-koneksi (FileJob) + yt-dlp (MediaJob)
@@ -142,7 +150,8 @@ swiftget/
   manager.py               antrean, jadwal, prioritas, riwayat
   server.py                server lokal 127.0.0.1 untuk extension
   ui/                      jendela, dialog, tabel kustom, tema, ikon
-extension/                 extension browser (Manifest V3)
+extension/                 extension browser (Manifest V3, pairing otomatis)
+STORE_PUBLISHING.md        panduan menerbitkan extension ke toko
 tests/test_engine.py       tes otomatis engine
 packaging/                 build.py, make_icons.py
 .github/workflows/         build otomatis macOS/Windows/Linux
@@ -162,15 +171,76 @@ def namasitus(net, url):
 
 ---
 
-## Membangun aplikasi mandiri
+## Membangun aplikasi (installer)
 
-```bash
-pip install -r requirements-dev.txt
-python packaging/build.py          # hasil di dist/
+Hasil build **bukan** folder `.exe + _internal` mentah, melainkan paket siap bagikan:
+
+| OS | Hasil di `dist/release/` |
+|---|---|
+| Windows | `SwiftGet-Setup-<versi>.exe` (installer: Start Menu, shortcut desktop, uninstaller, opsi jalan saat login) + `…-windows-portable.zip` |
+| macOS | `SwiftGet-<versi>-macos-<arsitektur>.dmg` (seret ke Applications) |
+| Linux | `SwiftGet-<versi>-linux-<arsitektur>.tar.gz` |
+
+Folder `_internal` tetap ada (itu cara kerja PyInstaller), tetapi dengan installer ia tersimpan rapi di folder instalasi dan tidak terlihat pengguna.
+
+**Lokal:** `pip install -r requirements-dev.txt` lalu `python packaging/build.py` (jalankan di OS target; Windows butuh
+[Inno Setup 6](https://jrsoftware.org/isdl.php) agar installer terbentuk, tanpa itu hanya zip portabel).
+
+**Otomatis lewat GitHub Actions** (disarankan, bisa bangun semua OS tanpa perangkatnya). Build & rilis hanya terjadi kalau **angka
+`version` di `pyproject.toml` berubah**:
+
+| Yang kamu push | Hasil |
+|---|---|
+| Perubahan file lain saja (kode, README, dll.) | workflow **tidak jalan** sama sekali |
+| `pyproject.toml` diubah, tapi bukan versinya (mis. dependensi) | workflow jalan sebentar, lalu semua job **dilewati** |
+| Angka `version` di `pyproject.toml` berubah | **build 4 OS + Release otomatis** (tag `v<versi>`) |
+
+Cara merilis versi baru:
+1. Ubah baris `version = "1.2.1"` di `pyproject.toml`, mis. menjadi `"1.2.2"`.
+2. `git add . && git commit -m "Rilis 1.2.2" && git push`
+3. Tunggu ±10-15 menit. Hasilnya muncul di halaman **Releases** dengan tag `v1.2.2` (dibuat otomatis), berisi installer Windows, `.dmg` Mac Intel
+   dan Apple Silicon, paket Linux, dan paket extension. Memantau prosesnya: tab *Actions*.
+
+### Alur build (yang terjadi di balik layar)
 ```
-PyInstaller harus dijalankan di OS target (Mac untuk `.app`, Windows untuk `.exe`). Workflow GitHub Actions di `.github/workflows/build.yml`
-membangun keempat target (Mac Intel, Mac Apple Silicon, Windows, Linux) sekaligus tanpa perlu punya semua perangkatnya.
-Agar `.app` tidak diblokir Gatekeeper di Mac lain perlu *code signing + notarization* (Apple Developer Account).
+push → GitHub cek: pyproject.toml ikut berubah?   tidak → selesai (tidak ada yang jalan)
+          │ ya
+          ▼
+  job "version"   baca version sekarang & version di commit sebelumnya → berubah? tidak → semua job dilewati
+          │ ya (validasi format 1.2.3)
+          ▼
+  ┌─ job "app" (paralel, 4 mesin) ──────────────────────┐   job "extension"
+  │ Windows │ Mac Intel │ Mac Apple Silicon │ Linux     │   (zip untuk toko extension)
+  │ pasang dependensi dari pyproject.toml ([dev])       │
+  │ tes engine → PyInstaller → kemas (installer/dmg/tar)│
+  └──────────────────────────────────────────────────────┘
+          ▼
+  job "release"   kumpulkan semua file → buat tag v<versi> → buat/perbarui Release → lampirkan file
+```
+Walau satu OS gagal, file dari OS lain tetap dilampirkan. Tombol *Run workflow* di tab Actions membangun ulang versi yang tertulis di
+`pyproject.toml` tanpa mengubah apa pun. Mendorong ulang versi yang sama memperbarui file di Release itu. Jika job `release` gagal dengan
+error izin (403), buka repositori › *Settings › Actions › General › Workflow permissions* › pilih *Read and write permissions*.
+
+### Fungsi `pyproject.toml`
+File ini adalah "kartu identitas" proyek (standar PEP 621) dan dipakai di banyak tempat sekaligus:
+
+| Bagian | Gunanya |
+|---|---|
+| `[project] version` | **Satu-satunya sumber versi.** Dibaca aplikasi (pojok kanan bawah), `build.py` (nama file hasil build, info `.exe`), dan workflow (tag Release) |
+| `[project] dependencies` | Daftar pustaka yang dipasang oleh `pip install -r requirements.txt` (isinya hanya `-e .`) |
+| `[project.optional-dependencies]` | `dev` (PyInstaller, Pillow untuk build) dan `mac` (efek kaca native); dipasang lewat `pip install -e ".[dev]"` |
+| `[project] name, description, readme, urls, classifiers` | Metadata proyek (tampil di GitHub/PyPI dan alat Python lain) |
+| `requires-python` | Versi Python minimum (3.10) |
+| `[project.gui-scripts]` | Membuat perintah `swiftget` yang membuka aplikasi setelah `pip install .`; bisa juga `python -m swiftget` |
+| `[build-system]` + `[tool.setuptools…]` | Cara pip membangun paket (hanya folder `swiftget/`, bukan `extension`, `tests`, dll.) |
+
+Menambah pustaka baru cukup menambahkannya ke `dependencies`; jangan menulis versi di tempat lain.
+
+**Peringatan keamanan OS (wajar untuk aplikasi tanpa tanda tangan):**
+- Windows SmartScreen menampilkan *"Windows protected your PC"* → klik *More info › Run anyway*. Menghilangkannya butuh sertifikat code signing
+  (berbayar; proyek open source bisa mengajukan gratis lewat SignPath Foundation).
+- macOS menolak membuka aplikasi dari developer tak dikenal → klik kanan aplikasi › *Open*, atau jalankan
+  `xattr -cr /Applications/SwiftGet.app`. Menghilangkannya butuh Apple Developer Account (signing + notarization).
 
 Tes engine: `python -m tests.test_engine`
 
@@ -191,7 +261,7 @@ Tes engine: `python -m tests.test_engine`
 | Masalah | Solusi |
 |---|---|
 | Extension: "Aplikasi tidak aktif" | Pastikan SwiftGet berjalan & port sama di extension dan Pengaturan › Browser |
-| Extension: "Token salah" | Salin ulang token dari aplikasi ke Opsi extension |
+| Extension: "Token salah" | Buka popup extension › *Hubungkan ke SwiftGet* (token diperbarui otomatis) |
 | "Port dipakai aplikasi lain" | Ganti port di Pengaturan › Browser, lalu samakan di extension |
 | Video hanya 360p/720p atau tidak ada MP3 | `pip install imageio-ffmpeg` (atau pilih path FFmpeg di Pengaturan), lalu restart SwiftGet |
 | Video YouTube gagal | Perbarui yt-dlp; untuk konten berlogin pilih *Ambil cookies dari* browser kamu |
@@ -199,4 +269,7 @@ Tes engine: `python -m tests.test_engine`
 | Video tidak bisa diputar di QuickTime/iPhone | Unduh dengan Kompatibilitas = H.264 + AAC (default). Untuk file lama berformat VP9/Opus: klik kanan › Unduh ulang |
 | Unduhan YouTube ditolak/gagal | Pastikan koneksi video = 1 (klik kanan › Properti), perbarui yt-dlp, dan coba *Ambil cookies dari* browser |
 | YouTube: `HTTP Error 403: Forbidden` | SwiftGet otomatis mencoba jalur klien alternatif. Bila tetap gagal: perbarui yt-dlp, set koneksi video = 1, dan coba *Ambil cookies dari* browser. yt-dlp versi baru kadang butuh runtime JavaScript (Deno atau Node.js) untuk YouTube; cek catatan rilis yt-dlp |
+| Dialog "Tambah unduhan" tidak muncul saat aplikasi di tray | Sudah diperbaiki di v1.2.1: dialog tampil sebagai jendela mandiri di depan. Bila masih tertutup, pastikan SwiftGet versi terbaru berjalan |
+| Windows: "Windows protected your PC" | Normal untuk aplikasi tanpa code signing: *More info › Run anyway* |
+| Extension: "Belum terhubung" | Pastikan SwiftGet berjalan, buka popup extension › *Hubungkan ke SwiftGet*, lalu klik *Ya* di aplikasi |
 | Tampilan font kecil/besar | Ubah skala di pengaturan sistem; ukuran teks diatur di `theme.py` (`font-size`) |

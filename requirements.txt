@@ -1,4 +1,1 @@
-PySide6>=6.6
-requests>=2.31
-yt-dlp[default]
-imageio-ffmpeg>=0.5      # FFmpeg bawaan lewat pip, tanpa Homebrew
+-e .

@@ -1,0 +1,43 @@
+# pyproject.toml = "kartu identitas" proyek Python (standar PEP 621).
+# Satu file ini dipakai oleh: aplikasi (membaca versi), pip (memasang dependensi), build installer, dan GitHub Actions (pemicu rilis).
+
+[build-system]                       # alat yang dipakai pip untuk membangun/memasang paket ini
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swiftget"
+version = "1.0.0"                    # <<< SATU-SATUNYA tempat versi. Ubah angka ini untuk merilis versi baru.
+description = "Download manager lintas platform dengan extension browser, pengunduh video, dan manajemen hasil unduhan"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["download-manager", "yt-dlp", "pyside6", "idm"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: X11 Applications :: Qt",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [                     # dipasang otomatis oleh: pip install -e .
+    "PySide6>=6.6",
+    "requests>=2.31",
+    "yt-dlp[default]",
+    "imageio-ffmpeg>=0.5",           # FFmpeg bawaan lewat pip, tanpa Homebrew
+]
+
+[project.optional-dependencies]
+dev = ["pyinstaller>=6.5", "Pillow>=10"]    # untuk membangun installer: pip install -e ".[dev]"
+mac = ["pyobjc-framework-Cocoa"]            # opsional: efek kaca native macOS
+
+[project.urls]
+Homepage = "https://github.com/dekDika13/SwiftGet"
+Releases = "https://github.com/dekDika13/SwiftGet/releases"
+Issues = "https://github.com/dekDika13/SwiftGet/issues"
+
+[project.gui-scripts]                # setelah "pip install .", perintah `swiftget` membuka aplikasi
+swiftget = "swiftget.app:main"
+
+[tool.setuptools.packages.find]      # hanya paket aplikasi; folder lain (extension, packaging, tests) bukan paket Python
+include = ["swiftget*"]

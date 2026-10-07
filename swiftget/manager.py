@@ -1,6 +1,7 @@
 """Manajer antrean: jadwal, prioritas, jeda/lanjut, dan penyimpanan riwayat."""
 from __future__ import annotations
 import os, shutil, threading, time
+from urllib.parse import parse_qs, urlparse
 from collections import deque
 from pathlib import Path
 
@@ -8,6 +9,21 @@ from .config import OTHER, categorize
 from .engine import FileJob, MediaJob, RateLimiter, clean_error
 from .models import ACTIVE, DB, Task
 from .util import sanitize, unique_name
+
+
+def _norm_url(u: str) -> str:
+    u = u.strip().split("#")[0]
+    p = urlparse(u)
+    if "youtube.com" in p.netloc and p.path == "/watch" and parse_qs(p.query).get("v"):
+        return "yt:" + parse_qs(p.query)["v"][0]
+    if p.netloc.endswith("youtu.be") and p.path.strip("/"):
+        return "yt:" + p.path.strip("/")
+    return u.rstrip("/")
+
+
+def _media_key(t: Task):
+    o = t.media_opts
+    return (o.get("mode"), int(o.get("height") or 0), o.get("container"), o.get("audio_codec") if o.get("mode") == "audio" else None)
 
 
 class Manager:
@@ -40,22 +56,60 @@ class Manager:
         return str(base / category) if self.cfg["auto_categorize"] and category else str(base)
 
     def assign_name(self, t: Task, name: str):
-        """Tetapkan nama file unik + kategori + folder untuk tugas."""
+        """Tetapkan nama file + kategori + folder untuk tugas (unik, kecuali mode 'replace')."""
         with self.lock:
             name = sanitize(name)
             if t.auto_dir:
                 t.category = categorize(name)
                 t.save_dir = self.default_dir(t.category)
             os.makedirs(t.save_dir, exist_ok=True)
-            t.filename = unique_name(t.save_dir, name, self.reserved)
+            t.filename = name if t.dup == "replace" else unique_name(t.save_dir, name, self.reserved)
             self.reserved.add((t.save_dir, t.filename))
+
+    def find_duplicates(self, url, *, kind="file", filename="", save_dir=None, media_opts=None, title=""):
+        """Cari unduhan yang sama: di daftar (URL sama) dan di disk (nama file sama / judul serupa)."""
+        out, seen = [], set()
+        nurl, mo = _norm_url(url), media_opts or {}
+        probe = Task(kind=kind, media_opts=mo)
+        for t in list(self.tasks.values()):
+            if _norm_url(t.url) != nurl or (kind == "media") != (t.kind == "media"):
+                continue
+            if kind == "media" and _media_key(t) != _media_key(probe):
+                continue
+            path = t.path if t.status == "completed" and os.path.exists(t.path) else ""
+            out.append({"type": "task", "task": t, "path": path, "status": t.status})
+            seen.add(path)
+        try:
+            if kind == "file" and filename:
+                d = save_dir or self.default_dir(categorize(filename))
+                p = os.path.join(d, sanitize(filename))
+                if os.path.exists(p) and p not in seen:
+                    out.append({"type": "file", "path": p, "status": "file"})
+            elif kind == "media" and title:
+                d = save_dir or self.default_dir("Musik" if mo.get("mode") == "audio" else "Video")
+                try:
+                    from yt_dlp.utils import sanitize_filename as sf
+                    stem = sf(title)
+                except Exception:
+                    stem = sanitize(title)
+                stem = stem[:50].lower()
+                if os.path.isdir(d) and not any(x["path"] for x in out):
+                    for f in sorted(os.listdir(d)):
+                        full = os.path.join(d, f)
+                        if f.lower().startswith(stem) and os.path.isfile(full) and not f.endswith((".part", ".ytdl", ".temp")):
+                            out.append({"type": "file", "path": full, "status": "file"})
+                            break
+        except OSError:
+            pass
+        return out
 
     # ------------------------------------------------------------------ API
     def add(self, url, *, kind="file", filename="", save_dir=None, connections=None, referer="", cookies="",
-            user_agent="", headers=None, media_opts=None, start=True, start_at=0.0, checksum="", title="") -> Task:
+            user_agent="", headers=None, media_opts=None, start=True, start_at=0.0, checksum="", title="",
+            dup="number") -> Task:
         t = Task(url=url.strip(), kind=kind, referer=referer, cookies=cookies, user_agent=user_agent,
                  headers=headers or {}, media_opts=media_opts or {}, checksum=checksum.strip(), title=title,
-                 connections=int(connections or self.cfg["connections"]), start_at=start_at)
+                 connections=int(connections or self.cfg["connections"]), start_at=start_at, dup=dup)
         if kind == "media":
             t.category = "Musik" if t.media_opts.get("mode") == "audio" else "Video"
         elif filename:
@@ -70,7 +124,8 @@ class Manager:
             self.db.insert(t)
             t.order = float(t.id)
             if t.filename and kind == "file":
-                t.filename = unique_name(t.save_dir, t.filename, self.reserved)
+                if dup != "replace":
+                    t.filename = unique_name(t.save_dir, t.filename, self.reserved)
                 self.reserved.add((t.save_dir, t.filename))
             self.tasks[t.id] = t
             self.db.update(t)

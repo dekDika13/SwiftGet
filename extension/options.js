@@ -11,6 +11,12 @@ $("save").onclick = async () => {
     minSizeMB: +$("minSizeMB").value || 0, excluded: $("excluded").value });
   $("msg").textContent = "Tersimpan ✓";
 };
+$("pair").onclick = async () => {
+  $("pmsg").textContent = "Setujui permintaan di jendela SwiftGet…";
+  const r = await api.runtime.sendMessage({ type: "pair" });
+  $("pmsg").textContent = r?.ok ? "Terhubung ✓" : "Gagal: " + (r?.error || "ditolak");
+  if (r?.ok) $("token").value = (await api.storage.local.get({ token: "" })).token;
+};
 $("test").onclick = async () => {
   await $("save").onclick();
   const r = await api.runtime.sendMessage({ type: "ping" });

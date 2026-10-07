@@ -11,12 +11,13 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QStackedWidget,
                                QTabWidget, QVBoxLayout, QWidget)
 
-from .. import config
+from .. import autostart, config
 from ..analyzer import MEDIA_HOSTS, Analysis, analyze, fetch_media_info
-from ..config import categorize
+from ..config import categorize, export_extension
 from ..engine import ffmpeg_path
 from ..util import fmt_duration, fmt_size
 from . import icons, theme
+from .winutil import bring_to_front
 
 _THREADS = set()
 
@@ -168,7 +169,8 @@ class MediaOptions(QWidget):
 
 class AddDialog(QDialog):
     def __init__(self, win, manager, cfg, urls="", payload=None):
-        super().__init__(win)
+        super().__init__(None)                 # tanpa induk: tetap bisa tampil saat jendela utama di tray/diminimalkan
+        self.win = win
         self.m, self.cfg, self.payload = manager, cfg, payload or {}
         self.analysis, self.seq, self.custom_dir = None, 0, False
         self.setWindowTitle("Tambah unduhan")
@@ -562,43 +564,114 @@ class AddDialog(QDialog):
 
     def _commit(self, start):
         lines = self._lines()
-        if not lines and not (self.analysis and self.analysis.kind == "links"):
-            return
         p, a = self.payload, self.analysis
+        if not lines and not (a and a.kind == "links"):
+            return
         start_at = float(self.when.dateTime().toSecsSinceEpoch()) if self.sched.isChecked() else 0.0
         common = dict(save_dir=self.dir_edit.text() if self.custom_dir else None,
                       referer=p.get("referer", ""), cookies=p.get("cookies", ""), user_agent=p.get("userAgent", ""),
                       start=start, start_at=start_at)
+        jobs = []          # (url, kwargs) untuk setiap unduhan yang akan dibuat
         if len(lines) == 1 and a and a.kind == "file":
-            self.m.add(lines[0], filename=self.f_name.text().strip(), checksum=self.sum_edit.text(),
-                       connections=self._conn(False), **common)
+            jobs.append((lines[0], dict(filename=self.f_name.text().strip(), checksum=self.sum_edit.text(),
+                                        connections=self._conn(False))))
         elif len(lines) == 1 and a and a.kind == "media":
-            self.m.add(lines[0], kind="media", media_opts=self._media_opts(), title=a.media["title"],
-                       connections=self._conn(True), **common)
+            jobs.append((lines[0], dict(kind="media", media_opts=self._media_opts(), title=a.media["title"],
+                                        connections=self._conn(True))))
         elif a and a.kind == "links":
-            n = 0
             for i in range(self.l_list.count()):
                 it = self.l_list.item(i)
                 if it.checkState() == Qt.Checked:
                     k = it.data(Qt.UserRole)
-                    media = k["ext"] in ("m3u8", "mpd")
-                    kw = dict(common, referer=a.url)
-                    if media:
-                        self.m.add(k["url"], kind="media", media_opts=DEFAULT_MEDIA, connections=self._conn(True), **kw)
+                    if k["ext"] in ("m3u8", "mpd"):
+                        jobs.append((k["url"], dict(kind="media", media_opts=dict(DEFAULT_MEDIA), referer=a.url,
+                                                    connections=self._conn(True))))
                     else:
-                        self.m.add(k["url"], filename=k["name"], connections=self._conn(False), **kw)
-                    n += 1
-            if not n:
+                        jobs.append((k["url"], dict(filename=k["name"], referer=a.url, connections=self._conn(False))))
+            if not jobs:
                 QMessageBox.information(self, "Pilih tautan", "Centang minimal satu tautan.")
                 return
         else:
             for u in lines:
                 if MEDIA_HOSTS.search(u):
-                    self.m.add(u, kind="media", media_opts=DEFAULT_MEDIA, connections=self._conn(True), **common)
+                    jobs.append((u, dict(kind="media", media_opts=dict(DEFAULT_MEDIA), connections=self._conn(True))))
                 else:
-                    self.m.add(u, checksum=self.sum_edit.text() if len(lines) == 1 else "",
-                               connections=self._conn(False), **common)
+                    jobs.append((u, dict(checksum=self.sum_edit.text() if len(lines) == 1 else "",
+                                         connections=self._conn(False))))
+        policy = self._dup_policy(jobs, common["save_dir"])
+        if policy is None:
+            return
+        for url, kw in jobs:
+            self.m.add(url, dup=policy, **{**common, **kw})
         self.accept()
+
+    def _dup_policy(self, jobs, save_dir):
+        """Cek duplikat. Kembalikan 'number' | 'replace', atau None bila dibatalkan."""
+        found = []
+        for url, kw in jobs:
+            d = self.m.find_duplicates(url, kind=kw.get("kind", "file"), filename=kw.get("filename", ""), save_dir=save_dir,
+                                       media_opts=kw.get("media_opts"), title=kw.get("title", ""))
+            if d:
+                found.append((url, kw, d))
+        if not found:
+            return "number"
+        dlg = DuplicateDialog(self, found)
+        dlg.exec()
+        if dlg.choice == "open":
+            path = next((x["path"] for _, _, d in found for x in d if x["path"]), "")
+            if path and self.win:
+                self.win.reveal(path)
+            return None
+        if dlg.choice == "replace":
+            for _, _, d in found:
+                for x in d:
+                    if x["type"] == "task" and x["task"].status == "completed":
+                        self.m.remove(x["task"].id, delete_file=False)     # file lama akan ditimpa; hapus entri lamanya
+            return "replace"
+        return "number" if dlg.choice == "number" else None
+
+
+class DuplicateDialog(QDialog):
+    """Peringatan duplikat: beri nomor / ganti file lama / buka folder / batal."""
+
+    def __init__(self, parent, found):
+        super().__init__(parent)
+        self.choice = "cancel"
+        url, kw, dups = found[0]
+        path = next((x["path"] for _, _, d in found for x in d if x["path"]), "")
+        self.setWindowTitle("Unduhan yang sama terdeteksi")
+        self.setMinimumWidth(520)
+        l = QVBoxLayout(self)
+        l.setContentsMargins(24, 22, 24, 18)
+        l.setSpacing(10)
+        t = QLabel("File ini sudah pernah diunduh" if path else "Unduhan yang sama sudah ada di daftar")
+        t.setObjectName("DlgTitle")
+        l.addWidget(t)
+        name = kw.get("filename") or kw.get("title") or url
+        if len(found) > 1:
+            body = f"{len(found)} dari unduhan yang akan ditambahkan sudah ada. Contoh:\n{name}"
+        else:
+            st = dups[0].get("status", "")
+            body = name + ("\n\nLokasi file sebelumnya:\n" + path if path else
+                           f"\n\nStatus unduhan yang ada: {st}")
+        lab = muted(body)
+        lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        l.addWidget(lab)
+        l.addSpacing(6)
+
+        def add(text, choice, variant=None):
+            b = button(text, variant)
+            b.setMinimumHeight(38)
+            b.clicked.connect(lambda: (setattr(self, "choice", choice), self.accept()))
+            l.addWidget(b)
+            return b
+        add("Simpan dengan nomor di belakang nama  ( … (1) )", "number", "primary")
+        if path:
+            add("Ganti file lama (timpa)", "replace", "danger")
+            add("Buka folder file sebelumnya", "open")
+        c = button("Batal", "ghost")
+        c.clicked.connect(self.reject)
+        l.addWidget(c)
 
 
 class CountdownDialog(QDialog):
@@ -629,7 +702,7 @@ class CountdownDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, win, cfg, manager):
+    def __init__(self, win, cfg, manager, tab=0):
         super().__init__(win)
         self.cfg, self.m, self.win = cfg, manager, win
         self.setWindowTitle("Pengaturan")
@@ -645,6 +718,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._tab_network(), "Jaringan")
         tabs.addTab(self._tab_video(), "Video & Audio")
         tabs.addTab(self._tab_browser(), "Browser")
+        tabs.setCurrentIndex(tab)
         bar = QHBoxLayout()
         bar.addStretch()
         c, s = button("Batal", "ghost"), button("Simpan", "primary")
@@ -725,6 +799,7 @@ class SettingsDialog(QDialog):
         self._combo("theme", [(label, key) for key, label in theme.THEMES], f, "Tema")
         if sys.platform == "darwin":
             self._check("native_glass", "Efek kaca native macOS (eksperimental, perlu pyobjc & restart)", f)
+        self._check("autostart", "Jalankan SwiftGet saat login (di latar belakang, agar extension selalu terhubung)", f)
         self._check("clipboard_monitor", "Deteksi URL yang disalin ke clipboard", f)
         self._check("minimize_to_tray", "Tutup jendela = sembunyikan ke system tray", f)
         self._check("notify", "Tampilkan notifikasi saat unduhan selesai/gagal", f)
@@ -780,38 +855,56 @@ class SettingsDialog(QDialog):
 
     def _tab_browser(self):
         w, f = self._page()
+        f.addRow("", muted("Extension terhubung otomatis: setelah dipasang, SwiftGet menanyakan izin sekali (klik \"Ya\"). "
+                           "Tidak perlu menyalin token."))
+        row = QHBoxLayout()
+        for label, key in (("Chrome", "chrome"), ("Edge", "edge"), ("Brave", "brave"), ("Firefox", "firefox")):
+            b = button(label)
+            b.clicked.connect(lambda _=False, k=key: self.win.install_extension(k))
+            row.addWidget(b)
+        row.addStretch()
+        f.addRow("Pasang extension", row)
+        bf = button("Buka folder extension", None, "folder")
+        bf.clicked.connect(lambda: self.win.reveal(str(export_extension())))
+        f.addRow("", bf)
         self._check("server_enabled", "Aktifkan server lokal untuk extension browser", f)
         self._spin("server_port", 1024, 65535, f, "Port")
         self._check("extension_ask", "Tampilkan dialog konfirmasi saat extension mengirim unduhan", f)
+        self.paired = muted()
+        f.addRow("Terhubung", self.paired)
+        self._paired_label()
+        bu = button("Putuskan semua extension", "danger")
+        bu.clicked.connect(self._unpair)
+        f.addRow("", bu)
         row = QHBoxLayout()
         self.tok = QLineEdit(self.cfg["token"])
         self.tok.setReadOnly(True)
-        bc, br = button("Salin"), button("Buat ulang")
+        bc = button("Salin")
         bc.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.tok.text()))
-        br.clicked.connect(self._regen)
         row.addWidget(self.tok, 1)
         row.addWidget(bc)
-        row.addWidget(br)
-        f.addRow("Token", row)
-        f.addRow("", muted("Tempel token ini di halaman Opsi extension SwiftGet agar browser bisa terhubung. "
-                           "Jangan bagikan token kepada siapa pun."))
-        ext = Path(__file__).resolve().parents[2] / "extension"
-        b = button("Buka folder extension", None, "folder")
-        b.clicked.connect(lambda: self.win.reveal(str(ext)))
-        f.addRow("", b)
+        f.addRow("Token (lanjutan)", row)
         return w
 
-    def _regen(self):
+    def _paired_label(self):
+        n = len(self.cfg["paired_origins"])
+        self.paired.setText(f"{n} extension terhubung" if n else "Belum ada extension yang terhubung")
+
+    def _unpair(self):
         import secrets
-        self.tok.setText(secrets.token_urlsafe(24))
+        self.cfg["paired_origins"] = []
+        self.cfg["token"] = secrets.token_urlsafe(24)
+        self.tok.setText(self.cfg["token"])
+        self.cfg.save()
+        self._paired_label()
 
     def _save(self):
         old = (self.cfg["server_enabled"], self.cfg["server_port"], self.cfg["theme"], self.cfg["native_glass"])
         for k, w in self.fields.items():
             self.cfg[k] = (w.isChecked() if isinstance(w, QCheckBox) else w.value() if isinstance(w, QSpinBox)
                            else w.currentData() if isinstance(w, QComboBox) else w.text().strip())
-        self.cfg["token"] = self.tok.text()
         self.cfg.save()
+        autostart.enable(bool(self.cfg["autostart"]))
         self.m.apply_settings()
         self.win.settings_changed(old)
         self.accept()

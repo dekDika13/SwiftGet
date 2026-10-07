@@ -9,8 +9,9 @@ EXT_ORIGINS = ("chrome-extension://", "moz-extension://", "safari-web-extension:
 
 
 class LocalServer:
-    def __init__(self, cfg, handler):
-        self.cfg, self.handler, self.httpd = cfg, handler, None
+    def __init__(self, cfg, handler, pair=None):
+        """pair(origin) -> token | None. Dipanggil saat extension meminta terhubung (menunggu persetujuan pengguna)."""
+        self.cfg, self.handler, self.pair, self.httpd = cfg, handler, pair, None
 
     def start(self):
         outer = self
@@ -61,6 +62,13 @@ class LocalServer:
             def do_POST(self):
                 if not self._guard():
                     return
+                route = self.path.split("?")[0].strip("/")
+                if route == "pair":
+                    origin = self.headers.get("Origin", "")
+                    if not origin.startswith(EXT_ORIGINS) or not outer.pair:
+                        return self._send(403, {"ok": False, "error": "hanya extension browser yang boleh"})
+                    token = outer.pair(origin)
+                    return self._send(200, {"ok": True, "token": token}) if token else self._send(403, {"ok": False, "error": "ditolak"})
                 if not self._authed():
                     return self._send(401, {"ok": False, "error": "token salah"})
                 try:
@@ -68,7 +76,6 @@ class LocalServer:
                     if n > 1_000_000:
                         return self._send(413, {"ok": False})
                     data = json.loads(self.rfile.read(n) or b"{}")
-                    route = self.path.split("?")[0].strip("/")
                     if route not in ("add", "media"):
                         return self._send(404, {"ok": False})
                     outer.handler(route, data)

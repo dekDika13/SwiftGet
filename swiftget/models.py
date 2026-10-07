@@ -37,6 +37,7 @@ class Task:
     title: str = ""
     final_path: str = ""
     resolver: str = ""
+    dup: str = "number"         # cara menangani nama yang sama: number | replace
     # --- runtime (tidak disimpan) ---
     speed: float = field(default=0.0, repr=False)
     eta: float = field(default=-1.0, repr=False)

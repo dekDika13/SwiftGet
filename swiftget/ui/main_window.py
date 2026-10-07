@@ -1,5 +1,5 @@
 """Jendela utama SwiftGet."""
-import os, re, shutil, subprocess, sys
+import os, re, shutil, subprocess, sys, threading
 from urllib.parse import urlparse
 
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDialog, QFrame,
 
 from .. import resolvers
 from ..analyzer import MEDIA_HOSTS
-from ..config import ALL_EXTS, APP_NAME, APP_VERSION, CATEGORY_NAMES, data_dir
+from ..config import (ALL_EXTS, APP_NAME, APP_VERSION, CATEGORY_NAMES, EXT_STORE, data_dir, export_extension)
 from ..server import LocalServer
 from ..util import fmt_eta, fmt_size, fmt_speed
 from . import icons, theme
@@ -19,6 +19,7 @@ from .dialogs import AddDialog, CountdownDialog, PropertiesDialog, SettingsDialo
 from .table import (CAT_COLOR, CAT_ICON, ROLE_TASK, STATUS_LABEL, DownloadModel, NameDelegate, ProgressDelegate, Proxy,
                     StatusDelegate)
 from .widgets import Backdrop, SegmentMap, Sidebar, SpeedGraph
+from .winutil import bring_to_front
 
 
 class ElideLabel(QLabel):
@@ -41,6 +42,7 @@ class ElideLabel(QLabel):
 class MainWindow(QMainWindow):
     sig_event = Signal(str, int)
     sig_ext = Signal(str, object)
+    sig_pair = Signal(str, object)
 
     def __init__(self, cfg, manager):
         super().__init__()
@@ -64,6 +66,10 @@ class MainWindow(QMainWindow):
         self.apply_theme()
         self.sig_event.connect(self._on_event)
         self.sig_ext.connect(self._on_ext)
+        self.sig_pair.connect(self._on_pair)
+        self._pairing = False
+        if (os.path.exists(os.path.expanduser("~/SwiftGet Extension"))):
+            threading.Thread(target=lambda: export_extension(), daemon=True).start()   # segarkan extension yang sudah diekspor
         self.m.on_event = lambda k, i: self.sig_event.emit(k, i)
         QGuiApplication.clipboard().dataChanged.connect(self._clip)
         QApplication.instance().aboutToQuit.connect(self._cleanup)
@@ -74,6 +80,8 @@ class MainWindow(QMainWindow):
         for key in (Qt.Key_Return, Qt.Key_Enter):
             QShortcut(QKeySequence(key), self.table, context=Qt.WidgetShortcut).activated.connect(self.act_open)
         self.start_server()
+        if not self.cfg["onboarded"]:
+            QTimer.singleShot(900, self._onboard)
         self.timer = QTimer(self, interval=500)
         self.timer.timeout.connect(self._refresh)
         self.timer.start()
@@ -341,15 +349,15 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------------- dialog
     def open_add(self, urls="", payload=None):
-        d = AddDialog(self, self.m, self.cfg, urls, payload)
+        d = AddDialog(self, self.m, self.cfg, urls, payload)       # jendela mandiri: tetap muncul walau aplikasi di tray
+        if not self.isActiveWindow():
+            d.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.dialogs.append(d)
         d.destroyed.connect(lambda *_: self.dialogs.remove(d) if d in self.dialogs else None)
-        d.show()
-        d.raise_()
-        d.activateWindow()
+        bring_to_front(d)
 
-    def open_settings(self):
-        SettingsDialog(self, self.cfg, self.m).exec()
+    def open_settings(self, tab=0):
+        SettingsDialog(self, self.cfg, self.m, tab).exec()
 
     # ------------------------------------------------------------- aksi
     def sel(self):
@@ -550,8 +558,7 @@ class MainWindow(QMainWindow):
 
     def show_normal(self):
         self.showNormal()
-        self.raise_()
-        self.activateWindow()
+        bring_to_front(self)
 
     def notify(self, title, msg):
         if self.tray.isVisible() and self.cfg["notify"]:
@@ -609,13 +616,68 @@ class MainWindow(QMainWindow):
         if not self.cfg["server_enabled"]:
             self.lbl_srv.setText("Extension: nonaktif   ")
             return
-        s = LocalServer(self.cfg, lambda route, data: self.sig_ext.emit(route, data))
+        s = LocalServer(self.cfg, lambda route, data: self.sig_ext.emit(route, data), self._pair_request)
         try:
             s.start()
             self.server = s
             self.lbl_srv.setText(f"Extension: port {self.cfg['server_port']}   ")
         except OSError:
             self.lbl_srv.setText(f"Extension: port {self.cfg['server_port']} dipakai aplikasi lain   ")
+
+    # --- pairing otomatis: extension meminta terhubung, pengguna cukup menekan "Izinkan"
+    def _pair_request(self, origin):          # dipanggil dari thread server
+        if origin in self.cfg["paired_origins"]:
+            return self.cfg["token"]
+        if self._pairing:
+            return None
+        self._pairing = True
+        box = {"ev": threading.Event(), "ok": False}
+        self.sig_pair.emit(origin, box)
+        box["ev"].wait(90)
+        self._pairing = False
+        return self.cfg["token"] if box["ok"] else None
+
+    def _on_pair(self, origin, box):
+        kind = "Firefox" if origin.startswith("moz-extension") else "Chrome / Edge / Brave"
+        box_ui = QMessageBox(QMessageBox.Question, "Hubungkan extension browser",
+                             f"Extension SwiftGet di browser ({kind}) ingin terhubung untuk mengambil alih unduhan.\n\n"
+                             f"Izinkan?\n\nID: {origin}", QMessageBox.Yes | QMessageBox.No)
+        box_ui.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        bring_to_front(box_ui)
+        if box_ui.exec() == QMessageBox.Yes:
+            self.cfg["paired_origins"] = list(self.cfg["paired_origins"]) + [origin]
+            self.cfg.save()
+            box["ok"] = True
+            self.notify("Extension terhubung", "Unduhan dari browser kini otomatis dikirim ke SwiftGet.")
+        box["ev"].set()
+
+    def install_extension(self, key):
+        """Siapkan folder extension lalu buka halaman extensions browser (atau halaman toko bila sudah dipublikasikan)."""
+        if EXT_STORE.get(key):
+            QDesktopServices.openUrl(QUrl(EXT_STORE[key]))
+            return
+        path = str(export_extension())
+        self._copy(path)
+        app, win_exe, linux_exe, url = {
+            "chrome": ("Google Chrome", "chrome", "google-chrome", "chrome://extensions"),
+            "edge": ("Microsoft Edge", "msedge", "microsoft-edge", "edge://extensions"),
+            "brave": ("Brave Browser", "brave", "brave-browser", "brave://extensions"),
+            "firefox": ("Firefox", "firefox", "firefox", "about:debugging#/runtime/this-firefox")}[key]
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", app, url])
+            elif sys.platform.startswith("win"):
+                subprocess.Popen(["cmd", "/c", "start", "", win_exe, url])
+            else:
+                subprocess.Popen([linux_exe, url])
+        except OSError:
+            pass
+        steps = ("Klik \"Load Temporary Add-on…\" lalu pilih file manifest.json di folder tersebut."
+                 if key == "firefox" else
+                 "Aktifkan \"Developer mode\", klik \"Load unpacked\", lalu pilih folder tersebut.")
+        QMessageBox.information(self, "Pasang extension",
+                                f"Folder extension sudah disiapkan (path-nya juga disalin ke clipboard):\n\n{path}\n\n{steps}\n\n"
+                                "Setelah terpasang, SwiftGet akan meminta izin sekali. Klik \"Ya\" dan selesai.")
 
     def stop_server(self):
         if self.server:
@@ -653,6 +715,14 @@ class MainWindow(QMainWindow):
         if self._native_pending:
             self._native_pending = False
             QTimer.singleShot(80, self._go_native)
+
+    def _onboard(self):
+        self.cfg["onboarded"] = True
+        self.cfg.save()
+        if QMessageBox.question(self, "Selamat datang di SwiftGet",
+                                "Pasang extension browser sekarang agar unduhan dari Chrome, Edge, Brave, atau Firefox "
+                                "otomatis ditangkap SwiftGet?") == QMessageBox.Yes:
+            self.open_settings(3)
 
     def _go_native(self):
         if not mac_glass.apply(self):

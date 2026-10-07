@@ -1,2 +1,1 @@
--r requirements.txt
-pyobjc-framework-Cocoa   # opsional: efek kaca native macOS (eksperimental)
+-e .[mac]

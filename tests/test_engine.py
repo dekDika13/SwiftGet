@@ -52,7 +52,7 @@ def sha(p): return hashlib.sha256(open(p, "rb").read()).hexdigest()
 
 
 def main():
-    tmp = tempfile.mkdtemp()
+    tmp = os.path.realpath(tempfile.mkdtemp())
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H); port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     cfg = Settings(__import__("pathlib").Path(tmp) / "s.json"); cfg["download_dir"] = tmp + "/dl"
@@ -81,7 +81,11 @@ def main():
 
     got = []
     cfg["server_port"] = 0
-    ls = LocalServer(cfg, lambda r, d: got.append((r, d))); cfg["server_port"] = 16277; ls.start()
+    approved = []
+    def pair(origin):
+        approved.append(origin)
+        return cfg["token"] if origin.endswith("abc") else None
+    ls = LocalServer(cfg, lambda r, d: got.append((r, d)), pair); cfg["server_port"] = 16277; ls.start()
     def call(path, body=None, tok=cfg["token"], origin="chrome-extension://abc"):
         rq = urllib.request.Request(f"http://127.0.0.1:16277{path}", data=json.dumps(body).encode() if body else None,
                                     headers={"X-SwiftGet-Token": tok, "Origin": origin, "Content-Type": "application/json"})
@@ -91,6 +95,17 @@ def main():
     assert call("/add", {"url": "x"}, tok="salah") == 401
     assert call("/add", {"url": "x"}, origin="https://evil.com") == 403
     print("OK server extension: token & origin")
+    def pair_call(origin):
+        hdr = {"Content-Type": "application/json"}
+        if origin: hdr["Origin"] = origin
+        rq = urllib.request.Request("http://127.0.0.1:16277/pair", data=b"{}", headers=hdr)
+        try:
+            r = urllib.request.urlopen(rq); return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e: return e.code, None
+    st, body = pair_call("chrome-extension://abc"); assert st == 200 and body["token"] == cfg["token"]
+    assert pair_call("chrome-extension://zzz")[0] == 403
+    assert pair_call("https://evil.com")[0] == 403 and pair_call(None)[0] == 403
+    print("OK pairing otomatis: setuju, tolak, bukan-extension")
 
     cfg["speed_limit_kbps"] = 2500; m.apply_settings()
     t7 = m.add(base + "/file", filename="mv.bin", connections=4)
@@ -99,12 +114,12 @@ def main():
     m.update_task(t7.id, connections=2, save_dir=tmp + "/pindah", filename="baru.bin")
     time.sleep(1.5); cfg["speed_limit_kbps"] = 0; m.apply_settings()
     assert wait(m, t7.id, "completed"), (t7.status, t7.error)
-    assert os.path.normpath(t7.final_path) == os.path.normpath(tmp + "/pindah/baru.bin") and sha(t7.final_path) == SHA and t7.connections == 2
+    assert os.path.normpath(t7.final_path) == os.path.normpath(tmp + "/pindah/baru.bin") and sha(t7.final_path) == SHA and t7.connections == 2, t7.final_path
     assert not os.path.exists(tmp + "/dl/Lainnya/mv.bin.part")
     print("OK ubah koneksi+lokasi+nama saat berjalan:", t7.final_path)
 
     m.update_task(t.id, save_dir=tmp + "/arsip", filename="dipindah.bin"); time.sleep(0.8)
-    assert os.path.normpath(t.final_path) == os.path.normpath(tmp + "/arsip/dipindah.bin") and os.path.exists(t.final_path) and t.status == "completed"
+    assert os.path.normpath(t.final_path) == os.path.normpath(tmp + "/arsip/dipindah.bin") and os.path.exists(t.final_path) and t.status == "completed", t.final_path
     print("OK pindahkan file yang sudah selesai")
 
     from swiftget.engine import build_format
@@ -123,6 +138,46 @@ def main():
     txt = open(cf).read(); assert ".youtube.com\tTRUE\t/\tFALSE\t4102444800\ta\t1" in txt and "b\t2" in txt
     drop_cookie_file({"cookiefile": cf}); assert not os.path.exists(cf)
     print("OK cookie via file sementara (bukan header)")
+
+    # --- duplikat ---
+    dups = m.find_duplicates(base + "/file", kind="file", filename="tes file.bin")
+    assert any(d["type"] == "task" and d["path"] for d in dups), dups
+    assert any(d["path"] for d in m.find_duplicates("http://lain/x", kind="file", filename=t2.filename)), "file di disk"
+    assert not m.find_duplicates("http://lain/x", kind="file", filename="tidak-ada.bin")
+    print("OK deteksi duplikat (di daftar & di disk)")
+
+    orig = t2.final_path; m0 = os.path.getmtime(orig); time.sleep(1.1)
+    r = m.add(base + "/file", filename=t2.filename, dup="replace"); assert wait(m, r.id, "completed"), (r.status, r.error)
+    assert r.filename == t2.filename and os.path.normpath(r.final_path) == os.path.normpath(orig) and os.path.getmtime(orig) > m0
+    assert sha(orig) == SHA
+    print("OK mode ganti (replace): nama sama, file ditimpa")
+
+    n = m.add(base + "/file", filename=t2.filename); assert wait(m, n.id, "completed")
+    assert n.filename != t2.filename and os.path.exists(n.final_path) and os.path.exists(orig), n.filename
+    print("OK mode nomor:", n.filename)
+
+    import types
+    from swiftget.engine import MediaJob, RateLimiter
+    from swiftget.models import Task
+    class FakeY:
+        def __init__(self, params): self.params = params
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def extract_info(self, url, download=False): return {"title": "Vid"}
+        def prepare_filename(self, info):
+            return self.params["outtmpl"].replace("%(title).170B", "Vid").replace("%(height& [{}p]|)s", " [1080p]").replace("%(ext)s", "mp4")
+    fake = types.SimpleNamespace(YoutubeDL=FakeY)
+    vd = tmp + "/vid"; os.makedirs(vd)
+    mt2 = Task(url="http://v", kind="media", title="Vid", save_dir=vd, media_opts={"mode": "video", "container": "mp4"})
+    job = MediaJob(mt2, cfg, RateLimiter(), m)
+    tm = "%(title).170B%(height& [{}p]|)s.%(ext)s"
+    o = {"outtmpl": os.path.join(vd, tm)}
+    assert job._numbered_template(fake, o, mt2.media_opts, tm) == tm                      # belum ada file
+    open(vd + "/Vid [1080p].mp4", "w").close()
+    assert job._numbered_template(fake, o, mt2.media_opts, tm).endswith(" (1).%(ext)s")
+    open(vd + "/Vid [1080p] (1).mp4", "w").close()
+    assert job._numbered_template(fake, o, mt2.media_opts, tm).endswith(" (2).%(ext)s")
+    print("OK penomoran video duplikat: Judul [1080p] (1), (2)")
 
     a = m.add(base + "/file", filename="rm.bin"); wait(m, a.id, "completed"); p = a.final_path
     m.remove(a.id, delete_file=True); time.sleep(0.5); assert not os.path.exists(p); print("OK hapus + file")

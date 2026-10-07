@@ -1,17 +1,127 @@
-name: Build
-on: [workflow_dispatch, push]
+name: Build & Release
+
+# Build & rilis otomatis HANYA kalau VERSI di pyproject.toml berubah.
+#  - Push biasa (file lain saja)                        -> workflow tidak jalan sama sekali
+#  - Push yang mengubah pyproject.toml tapi bukan versi -> workflow jalan sebentar lalu semua job di-skip
+#  - Push yang mengubah angka version di pyproject.toml -> build 4 OS + Release otomatis (tag v<versi>)
+#
+# Cara merilis versi baru:
+#   1. Ubah baris  version = "1.2.1"  di pyproject.toml, mis. jadi "1.2.2"
+#   2. git add . && git commit -m "Rilis 1.2.2" && git push
+#   3. Tunggu +-10-15 menit; hasilnya muncul di halaman Releases
+on:
+  push:
+    branches: [main, master]
+    paths: ["pyproject.toml"]
+  workflow_dispatch:        # opsional: tombol "Run workflow" untuk membangun ulang versi yang ada di pyproject.toml
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: "1"
+
 jobs:
-  build:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      changed: ${{ steps.v.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          getver() { grep -m1 -E '^version[[:space:]]*=' | sed -E 's/.*"([^"]+)".*/\1/'; }
+          VERSION="$(getver < pyproject.toml)"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version di pyproject.toml harus berformat angka seperti 1.2.3 (terbaca: '$VERSION')"; exit 1
+          fi
+          CHANGED=true
+          if [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            OLD="$(git show "$BEFORE:pyproject.toml" 2>/dev/null | getver || true)"
+            [ "$OLD" = "$VERSION" ] && CHANGED=false
+            echo "versi sebelumnya: '${OLD}', sekarang: '$VERSION'"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          if [ "$CHANGED" = true ]; then echo "Membangun SwiftGet $VERSION"; else echo "Versi tidak berubah -> build dilewati"; fi
+
+  app:
+    needs: version
+    if: ${{ needs.version.outputs.changed == 'true' }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        include:
+          - { os: windows-latest, name: windows }
+          - { os: macos-15-intel, name: macos-intel }     # Mac Intel (x86_64)
+          - { os: macos-latest,   name: macos-arm }       # Apple Silicon (arm64)
+          - { os: ubuntu-latest,  name: linux }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install -r requirements-dev.txt
-      - run: python -m tests.test_engine
-      - run: python packaging/build.py
+      - name: Library sistem (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+      - name: Inno Setup (Windows)
+        if: runner.os == 'Windows'
+        run: choco install innosetup -y --no-progress
+      - run: python -m pip install ".[dev]"
+      - name: Tes engine
+        run: python -m tests.test_engine
+      - name: Build & kemas
+        run: python packaging/build.py
       - uses: actions/upload-artifact@v4
-        with: { name: "SwiftGet-${{ matrix.os }}", path: dist/ }
+        with:
+          name: SwiftGet-${{ matrix.name }}
+          path: dist/release/*
+
+  extension:
+    needs: version
+    if: ${{ needs.version.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python packaging/pack_extension.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SwiftGet-extension
+          path: dist/extension/*.zip
+
+  release:
+    # Tetap merilis walau salah satu OS gagal (file dari OS yang berhasil tetap dilampirkan)
+    if: ${{ !cancelled() && needs.version.outputs.changed == 'true' && needs.app.result != 'skipped' }}
+    needs: [version, app, extension]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+      - name: Daftar file yang akan dirilis
+        run: ls -lR artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: SwiftGet ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            ## Unduh
+            | Perangkat | File |
+            |---|---|
+            | Windows | `SwiftGet-Setup-${{ needs.version.outputs.version }}.exe` (installer) atau `…-windows-portable.zip` |
+            | Mac Intel | `SwiftGet-${{ needs.version.outputs.version }}-macos-x86_64.dmg` |
+            | Mac Apple Silicon (M1/M2/M3/M4) | `SwiftGet-${{ needs.version.outputs.version }}-macos-arm64.dmg` |
+            | Linux | `SwiftGet-${{ needs.version.outputs.version }}-linux-x86_64.tar.gz` |
+            | Extension browser (opsional) | `swiftget-chrome-edge.zip` / `swiftget-firefox.zip` |

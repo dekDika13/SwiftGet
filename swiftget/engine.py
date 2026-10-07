@@ -381,7 +381,7 @@ class MediaJob(Job):
                   "noplaylist": not playlist, "progress_hooks": [hook], "postprocessor_hooks": [pp],
                   "ratelimit": self.limiter.rate or None, "retries": cfg["retries"], "fragment_retries": cfg["retries"],
                   "concurrent_fragment_downloads": min(int(t.connections), 16), "continuedl": True,
-                  "windowsfilenames": True, "overwrites": False})
+                  "windowsfilenames": True, "overwrites": t.dup == "replace"})
         pps = []
         if mo.get("mode") == "audio":
             if mo.get("audio_codec", "best") != "best":
@@ -401,6 +401,12 @@ class MediaJob(Job):
         if mo.get("subs"):
             o.update({"writesubtitles": True, "subtitleslangs": ["id", "en"]})
         o["postprocessors"] = pps
+        if t.dup == "number" and not playlist:
+            try:
+                tmpl = self._numbered_template(yt_dlp, o, mo, tmpl)
+                o["outtmpl"] = os.path.join(t.save_dir, tmpl)
+            except Exception:
+                pass                                      # gagal memeriksa duplikat: lanjut dengan nama biasa
         first_err, path, vcodec = None, "", ""
         # YouTube kadang menjawab 403: coba jalur klien alternatif sebelum menyerah
         for clients in ([None, ["android_vr"], ["tv"]] if re.search(r"youtu", t.url) else [None]):
@@ -442,6 +448,33 @@ class MediaJob(Job):
         if os.path.isfile(t.final_path):
             t.total = t.downloaded = os.path.getsize(t.final_path)
         t.status, t.finished, t.note, t.speed = "completed", time.time(), warn, 0
+
+    def _numbered_template(self, yt_dlp, o, mo, tmpl):
+        """Jika file hasil sudah ada, kembalikan template bernomor: 'Judul [1080p] (1).mp4', '(2)', dst."""
+        t = self.t
+        if t.title:                                       # pemeriksaan murah dulu: ada file berjudul serupa?
+            try:
+                from yt_dlp.utils import sanitize_filename
+                stem = sanitize_filename(t.title)[:40].lower()
+            except Exception:
+                stem = sanitize(t.title)[:40].lower()
+            if not any(f.lower().startswith(stem) for f in os.listdir(t.save_dir)):
+                return tmpl
+        probe = dict(o, skip_download=True, progress_hooks=[], postprocessor_hooks=[], postprocessors=[])
+        with yt_dlp.YoutubeDL(probe) as y:
+            info = y.extract_info(t.url, download=False)
+            base = os.path.splitext(y.prepare_filename(info))[0]
+        if mo.get("mode") == "audio":
+            codec = mo.get("audio_codec", "best")
+            exts = [codec] if codec != "best" else ["m4a", "webm", "opus", "mp3", "mp4"]
+        else:
+            exts = [mo.get("container", "mp4")]
+        if not any(os.path.exists(f"{base}.{e}") for e in exts):
+            return tmpl
+        n = 1
+        while any(os.path.exists(f"{base} ({n}).{e}") for e in exts):
+            n += 1
+        return tmpl.replace(".%(ext)s", f" ({n}).%(ext)s")
 
     def _transcode(self, ff, path) -> bool:
         """Ubah video VP9/AV1 menjadi H.264 + AAC agar kompatibel di semua perangkat."""

@@ -6,8 +6,16 @@ const size = n => !n ? "" : n > 1048576 ? (n / 1048576).toFixed(1) + " MB" : Mat
   const [tab] = await api.tabs.query({ active: true, currentWindow: true });
   const s = await api.runtime.sendMessage({ type: "state", tabId: tab.id });
   const ok = s.ping?.ok, authed = s.ping?.data?.auth;
-  $("st").textContent = !ok ? "Aplikasi tidak aktif" : authed ? "Terhubung" : "Token salah";
+  $("st").textContent = !ok ? "Aplikasi tidak aktif" : authed ? "Terhubung" : "Belum terhubung";
   $("st").className = "pill " + (ok && authed ? "ok" : "bad");
+  if (ok && !authed) {
+    $("pair").hidden = false;
+    $("pair").onclick = async () => {
+      $("pairmsg").hidden = false; $("pairmsg").textContent = "Setujui permintaan di jendela SwiftGet…";
+      const r = await api.runtime.sendMessage({ type: "pair" });
+      $("pairmsg").textContent = r?.ok ? "Terhubung ✓ — buka ulang popup ini." : "Gagal: " + (r?.error || "ditolak");
+    };
+  }
   $("page").onclick = async () => {
     const r = await api.runtime.sendMessage({ type: "media", url: tab.url, title: tab.title });
     $("page").textContent = r?.ok ? "Terkirim ke SwiftGet ✓" : "Gagal — cek koneksi";
