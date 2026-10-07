@@ -53,11 +53,12 @@ class DownloadModel(QAbstractTableModel):
         if role == ROLE_TASK:
             return t
         if role == ROLE_SORT:
-            return [t.name.lower(), t.total, t.progress(), t.speed, t.eta if t.eta >= 0 else 1e12,
+            return [t.name.lower(), t.n_items if t.kind == "playlist" else t.total, t.progress(), t.speed, t.eta if t.eta >= 0 else 1e12,
                     STATUS_LABEL.get(t.status, t.status), t.added][c]
         if role == Qt.DisplayRole:
             p = t.progress()
-            return [t.name, fmt_size(t.total) if t.total > 0 else "—", f"{p * 100:.0f}%" if p >= 0 else "…",
+            size = f"{t.n_items} video" if t.kind == "playlist" else (fmt_size(t.total) if t.total > 0 else "—")
+            return [t.name, size, f"{p * 100:.0f}%" if p >= 0 else "…",
                     fmt_speed(t.speed) if t.is_active else "—", fmt_eta(t.eta) if t.is_active else "—",
                     STATUS_LABEL.get(t.status, t.status), datetime.fromtimestamp(t.added).strftime("%d %b %Y, %H:%M")][c]
         if role == Qt.TextAlignmentRole and c in (1, 3, 4):
@@ -79,6 +80,7 @@ class Proxy(QSortFilterProxyModel):
     def __init__(self):
         super().__init__()
         self.group, self.cat, self.text = "all", None, ""
+        self.parent_id = 0          # 0 = daftar utama (isi playlist disembunyikan); >0 = hanya isi playlist itu
         self.setSortRole(ROLE_SORT)
         self.setDynamicSortFilter(True)
 
@@ -97,6 +99,8 @@ class Proxy(QSortFilterProxyModel):
     def filterAcceptsRow(self, row, parent):
         t = self.sourceModel().task(row)
         if not t:
+            return False
+        if t.parent_id != self.parent_id:
             return False
         g = GROUPS.get(self.group)
         if g and t.status not in g:
@@ -134,7 +138,7 @@ class NameDelegate(QStyledItemDelegate):
         p.setBrush(bg)
         p.drawRoundedRect(tile, 9, 9)
         p.drawPixmap(int(tile.center().x() - 9), int(tile.center().y() - 9),
-                     icons.pixmap(CAT_ICON.get(t.category, "file"), col.name(), 18))
+                     icons.pixmap("list" if t.kind == "playlist" else CAT_ICON.get(t.category, "file"), col.name(), 18))
         x = int(tile.right()) + 12
         w = r.right() - x - 10
         f = QFont(opt.font)
@@ -147,7 +151,9 @@ class NameDelegate(QStyledItemDelegate):
         f.setPixelSize(11)
         f.setWeight(QFont.Normal)
         p.setFont(f)
-        if t.status == "error" and t.error:
+        if t.kind == "playlist":
+            sub, colr = f"Playlist  ·  {t.note}", theme.c("red") if t.status == "error" else theme.c("muted")
+        elif t.status == "error" and t.error:
             sub, colr = t.error, theme.c("red")
         elif t.note and t.is_active:
             sub, colr = t.note, theme.c("muted")

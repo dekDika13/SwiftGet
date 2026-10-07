@@ -110,6 +110,8 @@ QFrame#Content { background:@content_bg; @content_css }
 QFrame#Card { background:@surface; border:1px solid @border; border-radius:@r_card; }
 QFrame#Footer { background:@surface; border:1px solid @border; border-radius:@r_card; }
 QLabel { background:transparent; }
+QScrollArea { background:transparent; border:none; }
+QScrollArea > QWidget > QWidget { background:transparent; }
 QLabel#Brand { font-size:17px; font-weight:700; }
 QLabel#NavHeader { color:@muted; font-size:10px; font-weight:700; padding-left:14px; }
 QLabel#Muted, QLabel#NavCount { color:@muted; }

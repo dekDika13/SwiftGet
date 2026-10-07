@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swiftget"
-version = "1.0.0"                    # <<< SATU-SATUNYA tempat versi. Ubah angka ini untuk merilis versi baru.
+version = "1.2.0"                    # <<< SATU-SATUNYA tempat versi. Ubah angka ini untuk merilis versi baru.
 description = "Download manager lintas platform dengan extension browser, pengunduh video, dan manajemen hasil unduhan"
 readme = "README.md"
 requires-python = ">=3.10"

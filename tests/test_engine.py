@@ -179,6 +179,40 @@ def main():
     assert job._numbered_template(fake, o, mt2.media_opts, tm).endswith(" (2).%(ext)s")
     print("OK penomoran video duplikat: Judul [1080p] (1), (2)")
 
+    # --- playlist (tanpa jaringan: semua anak berstatus jeda) ---
+    from swiftget.analyzer import playlist_summary
+    ps = playlist_summary({"title": "P", "entries": [{"title": "A", "url": "https://x/1"}, {"title": "[Private video]", "url": "https://x/2"},
+                                                    {"id": "abc", "ie_key": "Youtube", "title": "B"}, None]})
+    assert [e["title"] for e in ps["entries"]] == ["A", "B"] and ps["entries"][1]["url"].endswith("watch?v=abc") and ps["count"] == 2
+    assert m.add("https://www.youtube.com/watch?v=x", kind="media", cookies="a=b", start=False).cookies == ""
+    cfg["max_concurrent"] = 0                                              # jangan jalankan unduhan sungguhan
+    ents = [{"title": "Lagu A", "url": "http://127.0.0.1:1/a"}, {"title": "Lagu A", "url": "http://127.0.0.1:1/b"},
+            {"title": "Lagu B", "url": "http://127.0.0.1:1/c"}]
+    pl = m.add_playlist("http://127.0.0.1:1/list", "Daftar Putar", ents,
+                        media_opts={"mode": "video", "height": 720, "container": "mp4"}, start=False)
+    kids = m.children(pl.id)
+    assert len(kids) == 3 and [k.media_opts["suffix"] for k in kids] == ["", " (1)", ""], [k.media_opts for k in kids]
+    assert pl.save_dir.endswith("Daftar Putar") and all(os.path.normpath(k.save_dir) == os.path.normpath(pl.save_dir) for k in kids)
+    assert pl.filename == "Daftar Putar" and pl.id not in m.jobs and all(k.parent_id == pl.id for k in kids)
+    time.sleep(0.9)
+    assert pl.status == "paused" and pl.n_items == 3 and pl.note.startswith("0/3"), (pl.status, pl.note)
+    kids[0].status = "completed"; kids[1].status = "error"; time.sleep(0.9)
+    assert pl.status == "error" and "1/3 selesai" in pl.note and "1 gagal" in pl.note, (pl.status, pl.note)
+    m.resume(pl.id); time.sleep(0.9)
+    assert [k.status for k in kids] == ["completed", "queued", "queued"] and pl.status == "queued"
+    m.pause(pl.id); time.sleep(0.9)
+    assert [k.status for k in kids] == ["completed", "paused", "paused"] and pl.status == "paused"
+    d1 = m.find_playlist_duplicates("Daftar Putar")
+    assert d1 and d1["tasks"][0].id == pl.id and not m.find_playlist_duplicates("Lain")
+    for k in kids[:2]: m.remove(k.id)
+    time.sleep(0.9); assert pl.id in m.tasks and m.children(pl.id)[0].id == kids[2].id
+    m.remove(pl.id); time.sleep(0.3); assert pl.id not in m.tasks and not m.children(pl.id)
+    pl2 = m.add_playlist("http://l", "Dua", ents[:2], media_opts={"mode": "audio"}, start=False)
+    for k in m.children(pl2.id): m.remove(k.id)
+    time.sleep(0.9); assert pl2.id not in m.tasks, "induk kosong harus hilang otomatis"
+    cfg["max_concurrent"] = 3
+    print("OK playlist: induk+isi, nama kembar (1), agregasi status, jeda/lanjut massal, hapus, deteksi nama sama")
+
     a = m.add(base + "/file", filename="rm.bin"); wait(m, a.id, "completed"); p = a.final_path
     m.remove(a.id, delete_file=True); time.sleep(0.5); assert not os.path.exists(p); print("OK hapus + file")
     m.shutdown(); print("SEMUA TES LULUS")

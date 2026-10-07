@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 from .config import ALL_EXTS, categorize
 from .engine import clean_error, drop_cookie_file, ffmpeg_path, probe, ytdlp_base
 from .resolvers import ResolveError, resolve
-from .util import Net, filename_from_url, ensure_ext, sanitize
+from .util import Net, ensure_ext, filename_from_url, is_youtube, sanitize
 
 MEDIA_HOSTS = re.compile(r"(youtube\.com|youtu\.be|vimeo\.com|tiktok\.com|twitter\.com|//x\.com|instagram\.com|facebook\.com|"
                          r"fb\.watch|dailymotion\.com|twitch\.tv|soundcloud\.com|bilibili\.com|reddit\.com|streamable\.com)", re.I)
@@ -44,6 +44,8 @@ def _analyze(cfg, url, referer, cookies, ua) -> Analysis:
     if not re.match(r"https?://", url, re.I):
         return Analysis(kind="error", url=url, message="URL harus diawali http:// atau https://")
     path = urlparse(url).path.lower()
+    if is_youtube(url):
+        cookies = ""
     if MEDIA_HOSTS.search(url) or path.endswith((".m3u8", ".mpd")):
         info, err = fetch_media_info(cfg, url, referer, cookies)
         if info:
@@ -78,24 +80,71 @@ def _analyze(cfg, url, referer, cookies, ua) -> Analysis:
                     mime=p["mime"], resolver=rv.resolver, referer=rv.referer or referer, cookies=rv.cookies or cookies)
 
 
-def fetch_media_info(cfg, url, referer="", cookies=""):
-    """Kembalikan (info, error). info = ringkasan format yt-dlp."""
-    try:
-        import yt_dlp
-    except ImportError:
-        return None, "yt-dlp belum terpasang (pip install yt-dlp)."
+RETRY_RX = re.compile(r"reloaded|403|sign in|not a bot|player response|nsig|precondition|unable to extract|HTTP Error 4", re.I)
+
+
+def _extract(cfg, url, referer, cookies, flat, noplaylist, clients=None):
+    import yt_dlp
     o = ytdlp_base(cfg, referer, cookies, url)
-    o.update({"skip_download": True, "noplaylist": True, "extract_flat": "in_playlist"})
+    o.update({"skip_download": True, "noplaylist": noplaylist})
+    if flat:
+        o["extract_flat"] = "in_playlist"
+    if clients:
+        o["extractor_args"] = {"youtube": {"player_client": clients}}
     try:
         with yt_dlp.YoutubeDL(o) as y:
-            info = y.extract_info(url, download=False)
-    except Exception as e:
-        return None, clean_error(e)
+            return y.extract_info(url, download=False)
     finally:
         drop_cookie_file(o)
+
+
+def fetch_media_info(cfg, url, referer="", cookies=""):
+    """Kembalikan (info, error). info = ringkasan format yt-dlp (+ data playlist bila ada)."""
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        return None, "yt-dlp belum terpasang (pip install yt-dlp)."
+    yt = is_youtube(url)
+    if yt:
+        cookies = ""     # cookie dari browser membuat YouTube menjawab "The page needs to be reloaded"
+    plans = [(None, True)] + ([(["android_vr"], False), (["tv"], False)] if yt else [])
+    if cookies:
+        plans.append((None, False))      # coba lagi tanpa cookie
+    info, err = None, ""
+    for clients, use_cookies in plans:
+        try:
+            info = _extract(cfg, url, referer, cookies if use_cookies else "", True, True, clients)
+            break
+        except Exception as e:
+            err = err or clean_error(e)
+            if not RETRY_RX.search(str(e)) and not cookies:
+                break
     if not info:
-        return None, "Tidak ada media ditemukan."
-    return summarize(info), ""
+        return None, err or "Tidak ada media ditemukan."
+    summary = summarize(info)
+    if not summary["is_playlist"] and re.search(r"[?&]list=", url):       # video yang berada di dalam playlist
+        try:
+            pinfo = _extract(cfg, url, referer, "" if yt else cookies, True, False)
+            if pinfo and pinfo.get("_type") == "playlist":
+                summary["playlist"] = playlist_summary(pinfo)
+        except Exception:
+            pass
+    return summary, ""
+
+
+def playlist_summary(info) -> dict:
+    ents = []
+    for e in info.get("entries") or []:
+        if not e:
+            continue
+        title = e.get("title") or e.get("id") or "Video"
+        url = e.get("url") or e.get("webpage_url") or ""
+        if not url.startswith("http"):
+            vid = e.get("id")
+            url = f"https://www.youtube.com/watch?v={vid}" if vid and (e.get("ie_key") or "").lower() == "youtube" else ""
+        if url and title not in ("[Private video]", "[Deleted video]"):
+            ents.append({"title": title, "url": url})
+    return {"title": info.get("title") or "Playlist", "count": len(ents), "entries": ents}
 
 
 def summarize(info) -> dict:
@@ -104,7 +153,7 @@ def summarize(info) -> dict:
             "thumbnail": thumb, "extractor": info.get("extractor_key") or "", "duration": info.get("duration") or 0}
     if info.get("_type") == "playlist":
         entries = [e for e in info.get("entries") or [] if e]
-        return {**base, "is_playlist": True, "count": info.get("playlist_count") or len(entries),
+        return {**base, "is_playlist": True, "playlist": playlist_summary(info), "count": info.get("playlist_count") or len(entries),
                 "qualities": [{"height": h, "size": 0, "h264": h <= 1080} for h in (2160, 1440, 1080, 720, 480, 360)], "audio_only": False}
     fm = info.get("formats") or []
     size = lambda f: f.get("filesize") or f.get("filesize_approx") or 0

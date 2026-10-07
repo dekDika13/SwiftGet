@@ -2,20 +2,22 @@
 import os, re, shutil, subprocess, sys, threading
 from urllib.parse import urlparse
 
+from shiboken6 import isValid
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
                                QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton, QSizePolicy, QSplitter, QStackedWidget,
                                QSystemTrayIcon, QTableView, QToolButton, QVBoxLayout, QWidget)
 
-from .. import resolvers
+from .. import autostart, resolvers
 from ..analyzer import MEDIA_HOSTS
 from ..config import (ALL_EXTS, APP_NAME, APP_VERSION, CATEGORY_NAMES, EXT_STORE, data_dir, export_extension)
 from ..server import LocalServer
 from ..util import fmt_eta, fmt_size, fmt_speed
 from . import icons, theme
 from . import mac_glass
-from .dialogs import AddDialog, CountdownDialog, PropertiesDialog, SettingsDialog
+from .dialogs import AddDialog, CountdownDialog, PropertiesDialog, SettingsDialog, WelcomeDialog
+from .playlist import PlaylistDialog
 from .table import (CAT_COLOR, CAT_ICON, ROLE_TASK, STATUS_LABEL, DownloadModel, NameDelegate, ProgressDelegate, Proxy,
                     StatusDelegate)
 from .widgets import Backdrop, SegmentMap, Sidebar, SpeedGraph
@@ -47,7 +49,8 @@ class MainWindow(QMainWindow):
     def __init__(self, cfg, manager):
         super().__init__()
         self.cfg, self.m = cfg, manager
-        self.dialogs, self.server = [], None
+        self.dialogs, self.server, self._pl_dialogs = [], None, {}
+        self.cfg["autostart"] = autostart.is_enabled()      # selaraskan dengan kondisi sebenarnya di OS (installer bisa mengaktifkannya)
         self._quitting = self._cleaned = self._hint_shown = False
         self._pending_url = self._last_clip = ""
         self._sig, self._tick, self._disk = None, 0, ""
@@ -80,7 +83,7 @@ class MainWindow(QMainWindow):
         for key in (Qt.Key_Return, Qt.Key_Enter):
             QShortcut(QKeySequence(key), self.table, context=Qt.WidgetShortcut).activated.connect(self.act_open)
         self.start_server()
-        if not self.cfg["onboarded"]:
+        if not self.cfg["onboarded"] and "--background" not in sys.argv:
             QTimer.singleShot(900, self._onboard)
         self.timer = QTimer(self, interval=500)
         self.timer.timeout.connect(self._refresh)
@@ -356,6 +359,19 @@ class MainWindow(QMainWindow):
         d.destroyed.connect(lambda *_: self.dialogs.remove(d) if d in self.dialogs else None)
         bring_to_front(d)
 
+    def open_playlist(self, pid):
+        """Buka popup isi playlist (jendela yang sama dipakai ulang)."""
+        if pid not in self.m.tasks:
+            return
+        d = self._pl_dialogs.get(pid)
+        if d is not None and isValid(d):
+            bring_to_front(d)
+            return
+        d = PlaylistDialog(self, self.m, pid)
+        self._pl_dialogs[pid] = d
+        d.destroyed.connect(lambda *_: self._pl_dialogs.pop(pid, None))
+        bring_to_front(d)
+
     def open_settings(self, tab=0):
         SettingsDialog(self, self.cfg, self.m, tab).exec()
 
@@ -428,7 +444,9 @@ class MainWindow(QMainWindow):
         t = self.model.task(self.proxy.mapToSource(ix).row())
         if not t:
             return
-        if t.status == "completed":
+        if t.kind == "playlist":
+            self.open_playlist(t.id)
+        elif t.status == "completed":
             self.act_open()
         elif t.status in ("paused", "error"):
             self.m.resume(t.id)
@@ -441,7 +459,10 @@ class MainWindow(QMainWindow):
             return
         t = s[0]
         menu = QMenu(self)
-        if t.status == "completed":
+        if t.kind == "playlist":
+            menu.addAction("Lihat isi playlist…", lambda: self.open_playlist(t.id))
+            menu.addSeparator()
+        elif t.status == "completed":
             menu.addAction("Buka file", self.act_open)
         menu.addAction("Tampilkan di folder", self.act_folder)
         menu.addSeparator()
@@ -451,12 +472,13 @@ class MainWindow(QMainWindow):
             menu.addAction("Jeda", self.act_pause)
         if t.status in ("completed", "error"):
             menu.addAction("Unduh ulang", lambda: [self.m.redownload(x.id) for x in s])
-        if t.status not in ("completed",):
-            menu.addAction("Naikkan prioritas", lambda: self.m.move(t.id, -1))
-            menu.addAction("Turunkan prioritas", lambda: self.m.move(t.id, 1))
-        menu.addAction("Ubah resolusi / format…" if t.kind == "media" else "Properti: koneksi, lokasi, nama…", self.act_props)
-        if t.kind == "media":
-            menu.addAction("Properti: koneksi, lokasi, nama…", self.act_props)
+        if t.kind != "playlist":
+            if t.status not in ("completed",):
+                menu.addAction("Naikkan prioritas", lambda: self.m.move(t.id, -1))
+                menu.addAction("Turunkan prioritas", lambda: self.m.move(t.id, 1))
+            menu.addAction("Ubah resolusi / format…" if t.kind == "media" else "Properti: koneksi, lokasi, nama…", self.act_props)
+            if t.kind == "media":
+                menu.addAction("Properti: koneksi, lokasi, nama…", self.act_props)
         menu.addSeparator()
         menu.addAction("Salin tautan", lambda: self._copy("\n".join(x.url for x in s)))
         menu.addSeparator()
@@ -484,6 +506,15 @@ class MainWindow(QMainWindow):
         t = s[0]
         self.details.show()
         self.d_title.setText(f"{t.name}   ·   {STATUS_LABEL.get(t.status, t.status)}")
+        if t.kind == "playlist":
+            self.d["url"].set_full(t.url)
+            self.d["dir"].set_full(t.save_dir)
+            self.d["size"].set_full(f"{t.n_items} video")
+            self.d["conn"].set_full(f"{t.connections} koneksi per video")
+            self.d["resume"].set_full("Klik dua kali untuk melihat isi playlist")
+            self.d["err"].set_full(t.error or t.note or "—")
+            self.segmap.set_task(None)
+            return
         self.d["url"].set_full(t.url)
         self.d["dir"].set_full(t.path if t.status == "completed" else t.save_dir)
         self.d["size"].set_full(f"{fmt_size(t.downloaded)} / {fmt_size(t.total)}" if t.total else fmt_size(t.downloaded))
@@ -506,10 +537,10 @@ class MainWindow(QMainWindow):
         sp = self.m.speed
         self.lbl_speed.setText(fmt_speed(sp) if sp > 1 else "0 B/s")
         self.graph.set_values(self.m.speed_hist)
-        act = sum(t.is_active for t in tasks)
-        que = sum(t.status in ("queued", "scheduled") for t in tasks)
+        act = sum(t.is_active and t.kind != "playlist" for t in tasks)
+        que = sum(t.status in ("queued", "scheduled") and t.kind != "playlist" for t in tasks)
         lim = int(self.cfg["speed_limit_kbps"])
-        self.lbl_counts.setText(f"  {act} aktif  ·  {que} antre  ·  {sum(t.status == 'completed' for t in tasks)} selesai"
+        self.lbl_counts.setText(f"  {act} aktif  ·  {que} antre  ·  {sum(t.status == 'completed' and not t.parent_id for t in tasks)} selesai"
                                 + (f"  ·  batas {fmt_size(lim * 1024)}/s" if lim else ""))
         self.setWindowTitle(f"{APP_NAME}  —  ↓ {fmt_speed(sp)}" if sp > 1 else APP_NAME)
         self._tick += 1
@@ -531,6 +562,7 @@ class MainWindow(QMainWindow):
             self.b_folder.setEnabled(False)
 
     def _counts(self, tasks):
+        tasks = [t for t in tasks if not t.parent_id]          # isi playlist tidak dihitung terpisah
         c = {("status", "all"): len(tasks)}
         for key, grp in (("active", ("preparing", "downloading", "processing", "verifying")), ("queued", ("queued", "scheduled")),
                          ("paused", ("paused",)), ("done", ("completed",)), ("error", ("error",))):
@@ -717,11 +749,13 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(80, self._go_native)
 
     def _onboard(self):
+        dlg = WelcomeDialog(self)
+        accepted = dlg.exec() == QDialog.Accepted
         self.cfg["onboarded"] = True
+        if accepted and dlg.k_auto.isVisible() and dlg.k_auto.isChecked():
+            self.cfg["autostart"] = bool(autostart.enable(True))
         self.cfg.save()
-        if QMessageBox.question(self, "Selamat datang di SwiftGet",
-                                "Pasang extension browser sekarang agar unduhan dari Chrome, Edge, Brave, atau Firefox "
-                                "otomatis ditangkap SwiftGet?") == QMessageBox.Yes:
+        if accepted and dlg.k_ext.isChecked():
             self.open_settings(3)
 
     def _go_native(self):

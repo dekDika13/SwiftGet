@@ -8,14 +8,14 @@ from PySide6.QtCore import QDateTime, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QPixmap
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDateTimeEdit, QDialog, QFileDialog,
                                QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QStackedWidget,
+                               QInputDialog, QMessageBox, QPlainTextEdit, QScrollArea, QProgressBar, QPushButton, QSpinBox, QStackedWidget,
                                QTabWidget, QVBoxLayout, QWidget)
 
 from .. import autostart, config
 from ..analyzer import MEDIA_HOSTS, Analysis, analyze, fetch_media_info
 from ..config import categorize, export_extension
 from ..engine import ffmpeg_path
-from ..util import fmt_duration, fmt_size
+from ..util import fmt_duration, fmt_size, sanitize
 from . import icons, theme
 from .winutil import bring_to_front
 
@@ -174,19 +174,31 @@ class AddDialog(QDialog):
         self.m, self.cfg, self.payload = manager, cfg, payload or {}
         self.analysis, self.seq, self.custom_dir = None, 0, False
         self.setWindowTitle("Tambah unduhan")
-        self.setMinimumWidth(640)
+        self.setMinimumSize(580, 380)
+        scr = QGuiApplication.primaryScreen().availableGeometry()          # jangan lebih tinggi dari layar
+        self.resize(min(740, scr.width() - 60), min(720, scr.height() - 100))
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.has_ff = bool(ffmpeg_path(cfg))
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 22, 24, 20)
-        root.setSpacing(12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 22, 24, 18)
+        outer.setSpacing(12)
         t = QLabel("Tambah unduhan")
         t.setObjectName("DlgTitle")
-        root.addWidget(t)
-        root.addWidget(muted("Tempel satu atau banyak URL. SwiftGet otomatis mengenali file, video, atau halaman berisi banyak tautan."))
+        outer.addWidget(t)
+        outer.addWidget(muted("Tempel satu atau banyak URL. SwiftGet otomatis mengenali file, video, atau halaman berisi banyak tautan."))
+        scroll = QScrollArea()                 # isi bisa digulir, sehingga tidak menyusut/menumpuk di layar pendek
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body = QWidget()
+        root = QVBoxLayout(body)
+        root.setContentsMargins(0, 0, 8, 0)
+        root.setSpacing(12)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
         self.url_edit = QPlainTextEdit()
         self.url_edit.setPlaceholderText("https://…  (satu URL per baris)")
-        self.url_edit.setFixedHeight(70)
+        self.url_edit.setFixedHeight(64)
         root.addWidget(self.url_edit)
         row = QHBoxLayout()
         b_paste = button("Tempel", "ghost", "copy")
@@ -255,7 +267,7 @@ class AddDialog(QDialog):
         bar.addStretch()
         bar.addWidget(b_later)
         bar.addWidget(self.b_go)
-        root.addLayout(bar)
+        outer.addLayout(bar)
 
         self.timer = QTimer(self, singleShot=True, interval=700)
         self.timer.timeout.connect(self._auto)
@@ -371,6 +383,15 @@ class AddDialog(QDialog):
         ck.addWidget(self.k_subs)
         ck.addStretch()
         l.addLayout(ck)
+        self.pl_row = QWidget()
+        pr = QHBoxLayout(self.pl_row)
+        pr.setContentsMargins(0, 0, 0, 0)
+        pr.addWidget(QLabel("Nama folder playlist"))
+        self.pl_name = QLineEdit()
+        pr.addWidget(self.pl_name, 1)
+        self.pl_row.hide()
+        l.addWidget(self.pl_row)
+        self.k_playlist.toggled.connect(self.pl_row.setVisible)
         self.ff_warn = QLabel("FFmpeg tidak ditemukan: video resolusi tinggi tidak bisa digabung dan konversi MP3 tidak tersedia. "
                               "Jalankan: pip install imageio-ffmpeg, atau atur path-nya di Pengaturan › Video.")
         self.ff_warn.setObjectName("Warn")
@@ -478,8 +499,14 @@ class AddDialog(QDialog):
             codec = "H.264" if q.get("h264") else "VP9/AV1"
             self.q_combo.addItem(f"{q['height']}p   ·   {codec}{sz}", (q["height"], bool(q.get("h264"))))
         self._codec_hint()
-        self.k_playlist.setVisible(True)
-        self.k_playlist.setChecked(bool(mi.get("is_playlist")))
+        pl = mi.get("playlist")
+        self.k_playlist.setVisible(bool(pl))
+        if pl:
+            self.k_playlist.setText(f"Unduh seluruh playlist ({pl['count']} video)")
+            self.k_playlist.setChecked(bool(mi.get("is_playlist")))
+            self.k_playlist.setEnabled(not mi.get("is_playlist"))      # URL playlist murni: tidak ada pilihan video tunggal
+            self.pl_name.setText(sanitize(pl["title"]))                # nama awal = judul playlist hasil analisis (bisa diubah)
+        self.pl_row.setVisible(bool(pl) and self.k_playlist.isChecked())
         self.ff_warn.setVisible(not self.has_ff)
         (self.b_aud if mi.get("audio_only") else self.b_vid).setChecked(True)
         self.thumb.setText("")
@@ -571,6 +598,9 @@ class AddDialog(QDialog):
         common = dict(save_dir=self.dir_edit.text() if self.custom_dir else None,
                       referer=p.get("referer", ""), cookies=p.get("cookies", ""), user_agent=p.get("userAgent", ""),
                       start=start, start_at=start_at)
+        if (a and a.kind == "media" and len(lines) == 1 and a.media.get("playlist")
+                and self.k_playlist.isChecked() and a.media["playlist"]["entries"]):
+            return self._commit_playlist(common)
         jobs = []          # (url, kwargs) untuk setiap unduhan yang akan dibuat
         if len(lines) == 1 and a and a.kind == "file":
             jobs.append((lines[0], dict(filename=self.f_name.text().strip(), checksum=self.sum_edit.text(),
@@ -605,6 +635,51 @@ class AddDialog(QDialog):
             self.m.add(url, dup=policy, **{**common, **kw})
         self.accept()
 
+    def _free_playlist_name(self, name, save_dir, audio):
+        n = 1
+        while self.m.find_playlist_duplicates(f"{name} ({n})", save_dir, audio):
+            n += 1
+        return f"{name} ({n})"
+
+    def _commit_playlist(self, common):
+        """Playlist = 1 baris induk di daftar + 1 unduhan per video, disimpan di folder bernama playlist."""
+        a, pl = self.analysis, self.analysis.media["playlist"]
+        mo = self._media_opts()
+        mo["playlist"] = False
+        audio = mo.get("mode") == "audio"
+        name, policy = sanitize(self.pl_name.text().strip() or pl["title"]), "number"
+        while True:
+            dup = self.m.find_playlist_duplicates(name, common["save_dir"], audio)
+            if not dup:
+                break
+            dlg = PlaylistDuplicateDialog(self, name, dup)
+            dlg.exec()
+            if dlg.choice == "view":
+                if dup["tasks"] and self.win:
+                    self.win.open_playlist(dup["tasks"][0].id)
+                elif self.win:
+                    self.win.reveal(dup["path"])
+                return
+            if dlg.choice == "rename":
+                new, ok = QInputDialog.getText(self, "Ganti nama playlist", "Nama folder playlist yang baru:",
+                                               text=self._free_playlist_name(name, common["save_dir"], audio))
+                if not ok or not new.strip():
+                    return
+                name = sanitize(new.strip())
+                self.pl_name.setText(name)
+                continue
+            if dlg.choice == "replace":
+                for t in dup["tasks"]:
+                    self.m.remove(t.id, delete_file=False)          # file bernama sama akan ditimpa; hapus entri lamanya
+                policy = "replace"
+                break
+            return                                                  # batal
+        self.m.add_playlist(self.url_edit.toPlainText().strip().splitlines()[0], name, pl["entries"], media_opts=mo,
+                            base_dir=common["save_dir"], connections=self._conn(True), referer=common["referer"],
+                            cookies=common["cookies"], user_agent=common["user_agent"], start=common["start"],
+                            start_at=common["start_at"], dup=policy)
+        self.accept()
+
     def _dup_policy(self, jobs, save_dir):
         """Cek duplikat. Kembalikan 'number' | 'replace', atau None bila dibatalkan."""
         found = []
@@ -629,6 +704,40 @@ class AddDialog(QDialog):
                         self.m.remove(x["task"].id, delete_file=False)     # file lama akan ditimpa; hapus entri lamanya
             return "replace"
         return "number" if dlg.choice == "number" else None
+
+
+class PlaylistDuplicateDialog(QDialog):
+    """Playlist bernama sama sudah ada: ganti nama / timpa / lihat playlist lama / batal."""
+
+    def __init__(self, parent, name, dup):
+        super().__init__(parent)
+        self.choice = "cancel"
+        self.setWindowTitle("Playlist dengan nama yang sama sudah ada")
+        self.setMinimumWidth(540)
+        l = QVBoxLayout(self)
+        l.setContentsMargins(24, 22, 24, 18)
+        l.setSpacing(10)
+        t = QLabel("Playlist ini sudah ada")
+        t.setObjectName("DlgTitle")
+        l.addWidget(t)
+        where = (f"{len(dup['tasks'])} playlist dengan nama ini sudah ada di daftar unduhan."
+                 if dup["tasks"] else "Folder dengan nama ini sudah berisi file di disk.")
+        lab = muted(f"{name}\n\n{where}\nLokasi: {dup['path']}")
+        lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        l.addWidget(lab)
+        l.addSpacing(6)
+
+        def add(text, choice, variant=None):
+            b = button(text, variant)
+            b.setMinimumHeight(38)
+            b.clicked.connect(lambda: (setattr(self, "choice", choice), self.accept()))
+            l.addWidget(b)
+        add("Ganti nama playlist yang baru", "rename", "primary")
+        add("Timpa: file bernama sama diganti, entri playlist lama dihapus dari daftar", "replace", "danger")
+        add("Lihat playlist lama dulu", "view")
+        c = button("Batal", "ghost")
+        c.clicked.connect(self.reject)
+        l.addWidget(c)
 
 
 class DuplicateDialog(QDialog):
@@ -672,6 +781,38 @@ class DuplicateDialog(QDialog):
         c = button("Batal", "ghost")
         c.clicked.connect(self.reject)
         l.addWidget(c)
+
+
+class WelcomeDialog(QDialog):
+    """Dialog sambutan saat pertama kali dibuka: jalan otomatis saat login + pasang extension."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Selamat datang di SwiftGet")
+        self.setMinimumWidth(520)
+        l = QVBoxLayout(self)
+        l.setContentsMargins(26, 24, 26, 20)
+        l.setSpacing(12)
+        t = QLabel("Selamat datang di SwiftGet")
+        t.setObjectName("DlgTitle")
+        l.addWidget(t)
+        l.addWidget(muted("Dua pengaturan ini membuat SwiftGet langsung siap dipakai tanpa perlu dibuka manual. "
+                          "Keduanya bisa diubah kapan saja di Pengaturan."))
+        self.k_auto = QCheckBox("Jalankan SwiftGet otomatis saat login (di latar belakang, tanpa membuka jendela)")
+        self.k_auto.setChecked(True)
+        self.k_auto.setVisible(not autostart.is_enabled())
+        self.k_ext = QCheckBox("Pasang extension browser sekarang (Chrome, Edge, Brave, Firefox)")
+        self.k_ext.setChecked(True)
+        l.addWidget(self.k_auto)
+        l.addWidget(self.k_ext)
+        bar = QHBoxLayout()
+        later, go = button("Nanti saja", "ghost"), button("Lanjut", "primary")
+        later.clicked.connect(self.reject)
+        go.clicked.connect(self.accept)
+        bar.addStretch()
+        bar.addWidget(later)
+        bar.addWidget(go)
+        l.addLayout(bar)
 
 
 class CountdownDialog(QDialog):
@@ -904,7 +1045,8 @@ class SettingsDialog(QDialog):
             self.cfg[k] = (w.isChecked() if isinstance(w, QCheckBox) else w.value() if isinstance(w, QSpinBox)
                            else w.currentData() if isinstance(w, QComboBox) else w.text().strip())
         self.cfg.save()
-        autostart.enable(bool(self.cfg["autostart"]))
+        if not autostart.enable(bool(self.cfg["autostart"])):
+            QMessageBox.warning(self, "Jalankan saat login", "Pengaturan 'jalankan saat login' gagal diterapkan di sistem ini.")
         self.m.apply_settings()
         self.win.settings_changed(old)
         self.accept()

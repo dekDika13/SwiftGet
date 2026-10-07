@@ -11,7 +11,7 @@ ACTIVE = ("preparing", "downloading", "processing", "verifying")
 class Task:
     id: int = 0
     url: str = ""
-    kind: str = "file"          # file | media
+    kind: str = "file"          # file | media | playlist (induk dari banyak tugas media)
     filename: str = ""
     save_dir: str = ""
     auto_dir: bool = True
@@ -37,13 +37,15 @@ class Task:
     title: str = ""
     final_path: str = ""
     resolver: str = ""
+    parent_id: int = 0          # >0: tugas ini adalah isi dari sebuah playlist
     dup: str = "number"         # cara menangani nama yang sama: number | replace
     # --- runtime (tidak disimpan) ---
     speed: float = field(default=0.0, repr=False)
     eta: float = field(default=-1.0, repr=False)
     note: str = field(default="", repr=False)
+    n_items: int = field(default=0, repr=False)     # jumlah video (khusus induk playlist)
 
-    RUNTIME = ("speed", "eta", "note")
+    RUNTIME = ("speed", "eta", "note", "n_items")
 
     def to_dict(self):
         d = asdict(self)

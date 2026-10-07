@@ -19,14 +19,36 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    ipc = "SwiftGet-ipc-v1"
     lock = QLockFile(str(data_dir() / "app.lock"))
-    if not lock.tryLock(200):
+    if not lock.tryLock(200):                  # sudah berjalan (mis. di latar belakang): minta jendelanya dibuka, lalu keluar
+        sock = QLocalSocket()
+        sock.connectToServer(ipc)
+        if sock.waitForConnected(800):
+            sock.write(b"show")
+            sock.flush()
+            sock.waitForBytesWritten(800)
+            sock.disconnectFromServer()
+            return 0
         QMessageBox.information(None, APP_NAME, "SwiftGet sudah berjalan (cek system tray / menu bar).")
         return 0
     cfg = Settings()
     theme.set_theme(cfg["theme"])
     manager = Manager(cfg, DB(data_dir() / "downloads.db"))
     win = MainWindow(cfg, manager)
+    QLocalServer.removeServer(ipc)
+    server = QLocalServer()
+    server.listen(ipc)
+
+    def _on_ipc():
+        conn = server.nextPendingConnection()
+        if conn:
+            conn.waitForReadyRead(200)
+            conn.readAll()
+            conn.disconnectFromServer()
+        win.show_normal()
+    server.newConnection.connect(_on_ipc)
     if "--background" in sys.argv and win.tray.isVisible():
         pass                                  # mulai tersembunyi di system tray
     else:

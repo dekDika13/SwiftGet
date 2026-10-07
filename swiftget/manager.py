@@ -8,7 +8,7 @@ from pathlib import Path
 from .config import OTHER, categorize
 from .engine import FileJob, MediaJob, RateLimiter, clean_error
 from .models import ACTIVE, DB, Task
-from .util import sanitize, unique_name
+from .util import is_youtube, sanitize, unique_name
 
 
 def _norm_url(u: str) -> str:
@@ -39,6 +39,7 @@ class Manager:
         self.speed = 0.0
         self.speed_hist = deque([0.0] * 60, maxlen=60)
         self._was_busy = False
+        self._pl_seen = set()
         self._running = True
         self.apply_settings()
         for t in db.load_all():
@@ -106,8 +107,10 @@ class Manager:
     # ------------------------------------------------------------------ API
     def add(self, url, *, kind="file", filename="", save_dir=None, connections=None, referer="", cookies="",
             user_agent="", headers=None, media_opts=None, start=True, start_at=0.0, checksum="", title="",
-            dup="number") -> Task:
-        t = Task(url=url.strip(), kind=kind, referer=referer, cookies=cookies, user_agent=user_agent,
+            dup="number", parent_id=0) -> Task:
+        if kind == "media" and is_youtube(url):
+            cookies = ""                       # cookie browser membuat YouTube menolak ("page needs to be reloaded")
+        t = Task(url=url.strip(), kind=kind, referer=referer, cookies=cookies, user_agent=user_agent, parent_id=parent_id,
                  headers=headers or {}, media_opts=media_opts or {}, checksum=checksum.strip(), title=title,
                  connections=int(connections or self.cfg["connections"]), start_at=start_at, dup=dup)
         if kind == "media":
@@ -131,7 +134,95 @@ class Manager:
             self.db.update(t)
         return t
 
+    def children(self, pid):
+        return [x for x in list(self.tasks.values()) if x.parent_id == pid]
+
+    def add_playlist(self, url, name, entries, *, media_opts, base_dir=None, connections=None, referer="", cookies="",
+                     user_agent="", start=True, start_at=0.0, dup="number") -> Task:
+        """Buat playlist: 1 tugas induk (yang tampil di daftar) + 1 tugas media per video."""
+        audio = media_opts.get("mode") == "audio"
+        cat = "Musik" if audio else "Video"
+        folder = sanitize(name)
+        path = os.path.join(base_dir or self.default_dir(cat), folder)
+        with self.lock:                                  # atomik: loop jangan melihat induk tanpa isi
+            parent = Task(url=url.strip(), kind="playlist", filename=folder, title=folder, save_dir=path, final_path=path,
+                          category=cat, auto_dir=False, media_opts=dict(media_opts), dup=dup,
+                          connections=int(connections or self.cfg["media_connections"]),
+                          status="queued" if start else "paused")
+            self.db.insert(parent)
+            parent.order = float(parent.id)
+            self.tasks[parent.id] = parent
+            self.db.update(parent)
+            seen = {}
+            for e in entries:
+                title = e.get("title") or e["url"]
+                key = sanitize(title).lower()
+                n = seen.get(key, 0)
+                seen[key] = n + 1
+                mo = {**media_opts, "playlist": False, "suffix": f" ({n})" if n else ""}      # judul kembar → " (1)" di belakang
+                self.add(e["url"], kind="media", media_opts=mo, title=title, save_dir=path, connections=parent.connections,
+                         referer=referer, cookies=cookies, user_agent=user_agent, start=start, start_at=start_at,
+                         dup=dup, parent_id=parent.id)
+        return parent
+
+    def find_playlist_duplicates(self, name, base_dir=None, audio=False):
+        """Playlist dengan nama/folder sama: di daftar dan/atau di disk. None bila tidak ada."""
+        path = os.path.join(base_dir or self.default_dir("Musik" if audio else "Video"), sanitize(name))
+        tasks = [t for t in list(self.tasks.values())
+                 if t.kind == "playlist" and os.path.normpath(t.save_dir) == os.path.normpath(path)]
+        on_disk = os.path.isdir(path) and bool(os.listdir(path))
+        return {"tasks": tasks, "path": path, "disk": on_disk} if tasks or on_disk else None
+
+    def _refresh_playlists(self):
+        """Hitung status/progres induk playlist dari isinya (dipanggil dalam loop, di bawah lock)."""
+        kids = {}
+        for t in self.tasks.values():
+            if t.parent_id:
+                kids.setdefault(t.parent_id, []).append(t)
+        for p in [t for t in self.tasks.values() if t.kind == "playlist"]:
+            ks = kids.get(p.id, [])
+            n = len(ks)
+            if n == 0:                                   # semua isi dihapus dari daftar → hapus induknya
+                self.tasks.pop(p.id, None)
+                self.db.delete(p.id)
+                continue
+            p.n_items = n
+            done = sum(k.status == "completed" for k in ks)
+            err = sum(k.status == "error" for k in ks)
+            if any(k.is_active for k in ks):
+                st = "downloading"
+            elif any(k.status in ("queued", "scheduled") for k in ks):
+                st = "queued"
+            elif err:
+                st = "error"
+            elif any(k.status == "paused" for k in ks):
+                st = "paused"
+            else:
+                st = "completed"
+            prog = sum(1.0 if k.status == "completed" else (min(1.0, k.downloaded / k.total) if k.total > 0 else 0.0)
+                       for k in ks) / n
+            p.total, p.downloaded = 1000, int(prog * 1000)
+            p.speed = sum(k.speed for k in ks if k.is_active)
+            rem = sum(max(0, k.total - k.downloaded) for k in ks if k.status != "completed" and k.total > 0)
+            p.eta = rem / p.speed if p.speed > 1 and rem > 0 else -1
+            p.note = f"{done}/{n} selesai" + (f"  ·  {err} gagal" if err else "")
+            p.error = f"{err} video gagal — buka playlist untuk melihat" if err else ""
+            old = p.status
+            p.status = st
+            if st == "completed" and not p.finished:
+                p.finished = time.time()
+            if old != st:
+                self.db.update(p)
+                if p.id in self._pl_seen and st in ("completed", "error"):
+                    self._emit(st, p.id)
+            self._pl_seen.add(p.id)
+
     def pause(self, tid):
+        t0 = self.tasks.get(tid)
+        if t0 and t0.kind == "playlist":
+            for k in self.children(tid):
+                self.pause(k.id)
+            return
         with self.lock:
             t = self.tasks.get(tid)
             if t and (t.status in ACTIVE or t.status in ("queued", "scheduled")):
@@ -142,6 +233,11 @@ class Manager:
                 self.db.update(t)
 
     def resume(self, tid):
+        t0 = self.tasks.get(tid)
+        if t0 and t0.kind == "playlist":
+            for k in self.children(tid):
+                self.resume(k.id)
+            return
         with self.lock:
             t = self.tasks.get(tid)
             if t and t.status in ("paused", "error", "scheduled"):
@@ -230,6 +326,11 @@ class Manager:
         self.resume(tid)
 
     def redownload(self, tid):
+        t0 = self.tasks.get(tid)
+        if t0 and t0.kind == "playlist":
+            for k in self.children(tid):
+                self.redownload(k.id)
+            return
         with self.lock:
             t = self.tasks.get(tid)
             if not t or tid in self.jobs:
@@ -242,6 +343,16 @@ class Manager:
             self.db.update(t)
 
     def remove(self, tid, delete_file=False):
+        t0 = self.tasks.get(tid)
+        if t0 and t0.kind == "playlist":
+            for k in self.children(tid):
+                self.remove(k.id, delete_file)
+            with self.lock:
+                self.tasks.pop(tid, None)
+            self.db.delete(tid)
+            if delete_file:
+                threading.Thread(target=self._rmdir_later, args=(t0.save_dir,), daemon=True).start()
+            return
         with self.lock:
             t = self.tasks.pop(tid, None)
             job = self.jobs.get(tid)
@@ -258,6 +369,16 @@ class Manager:
             self._wipe_files(t, final=delete_file)
         threading.Thread(target=cleanup, daemon=True).start()
 
+    @staticmethod
+    def _rmdir_later(folder):
+        for delay in (2, 6, 15):                         # tunggu pembersihan file anak; hanya hapus folder bila kosong
+            time.sleep(delay)
+            try:
+                os.rmdir(folder)
+                return
+            except OSError:
+                pass
+
     def _wipe_files(self, t: Task, final: bool):
         try:
             if t.kind == "file" and t.filename:
@@ -271,7 +392,7 @@ class Manager:
             pass
 
     def clear_finished(self):
-        for t in [t for t in self.tasks.values() if t.status == "completed"]:
+        for t in [t for t in list(self.tasks.values()) if t.status == "completed" and not t.parent_id]:
             self.remove(t.id)
 
     def start_all(self):
@@ -324,12 +445,13 @@ class Manager:
     def _run(self, t: Task, job):
         try:
             job.run()
-            if t.status == "completed":
+            if t.status == "completed" and not t.parent_id:
                 self._emit("completed", t.id)
         except Exception as e:
             if job.reason not in ("pause", "cancel"):
                 t.status, t.error = "error", clean_error(e)
-                self._emit("error", t.id)
+                if not t.parent_id:
+                    self._emit("error", t.id)
         finally:
             t.speed, t.eta = 0, -1
             with self.lock:
@@ -348,15 +470,17 @@ class Manager:
                 for t in self.tasks.values():
                     if t.status == "scheduled" and t.start_at <= now:
                         t.status = "queued"
-                active = [t for t in self.tasks.values() if t.status in ACTIVE]
+                real = [t for t in self.tasks.values() if t.kind != "playlist"]
+                active = [t for t in real if t.status in ACTIVE]
                 slots = int(self.cfg["max_concurrent"]) - len(active)
                 if slots > 0:
-                    queued = sorted((t for t in self.tasks.values() if t.status == "queued" and t.id not in self.jobs),
+                    queued = sorted((t for t in real if t.status == "queued" and t.id not in self.jobs),
                                     key=lambda t: t.order)
                     for t in queued[:slots]:
                         self._start(t)
+                self._refresh_playlists()
                 self.speed = sum(t.speed for t in active)
-                busy = bool(active) or any(t.status == "queued" for t in self.tasks.values())
+                busy = bool(active) or any(t.status == "queued" for t in real)
             self.speed_hist.append(self.speed)
             if self._was_busy and not busy:
                 self._emit("queue_done")

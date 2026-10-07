@@ -374,8 +374,9 @@ class MediaJob(Job):
 
         playlist = bool(mo.get("playlist"))
         q = "%(height& [{}p]|)s" if mo.get("mode") != "audio" else ""
-        tmpl = (f"%(playlist_title|Playlist)s/%(playlist_index)03d - %(title).140B{q}.%(ext)s" if playlist
-                else f"%(title).170B{q}.%(ext)s")
+        sfx = str(mo.get("suffix", "")).replace("%", "%%")          # " (1)" untuk judul kembar di dalam satu playlist
+        tmpl = (f"%(playlist_title|Playlist)s/%(title).150B{q}{sfx}.%(ext)s" if playlist
+                else f"%(title).170B{q}{sfx}.%(ext)s")
         o = ytdlp_base(cfg, t.referer, t.cookies, t.url)
         o.update({"outtmpl": os.path.join(t.save_dir, tmpl), "format": build_format(mo, has_ff),
                   "noplaylist": not playlist, "progress_hooks": [hook], "postprocessor_hooks": [pp],

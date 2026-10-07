@@ -7,6 +7,13 @@ from urllib.parse import unquote, urlparse
 import requests
 
 
+YT_RX = re.compile(r"(youtube\.com|youtu\.be|youtube-nocookie\.com)", re.I)
+
+
+def is_youtube(url: str) -> bool:
+    return bool(YT_RX.search(url or ""))
+
+
 def fmt_size(n) -> str:
     if n is None or n < 0:
         return "—"

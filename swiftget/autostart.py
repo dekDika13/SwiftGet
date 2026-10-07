@@ -46,3 +46,18 @@ def enable(on: bool) -> bool:
         return True
     except Exception:
         return False
+
+
+def is_enabled() -> bool:
+    """Status sebenarnya di OS (bukan hanya di pengaturan), karena installer Windows juga bisa mengaktifkannya."""
+    try:
+        if sys.platform.startswith("win"):
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+                winreg.QueryValueEx(k, NAME)
+                return True
+        if sys.platform == "darwin":
+            return (Path.home() / "Library" / "LaunchAgents" / "com.swiftget.app.plist").exists()
+        return (Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autostart" / "swiftget.desktop").exists()
+    except OSError:
+        return False
