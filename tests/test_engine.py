@@ -23,6 +23,12 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/page"):
             b = b"<html>hi</html>"; self.send_response(200); self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+        origin = f"http://127.0.0.1:{self.server.server_address[1]}/"
+        if self.path.startswith("/hotlink") and self.headers.get("Referer") != origin:     # anti-hotlink seperti WordPress/Cloudflare
+            self.send_response(403); self.send_header("Content-Length", "0"); self.end_headers(); return
+        if self.path.startswith("/norange403") and self.headers.get("Range"):               # WAF yang memblokir header Range
+            self.send_response(403); self.send_header("Content-Length", "0"); self.end_headers(); return
+        pace = (16384, 0.02) if self.path.startswith("/slow") else (65536, 0.002)           # /slow ≈ 800 KB/s per koneksi
         rng = self.headers.get("Range")
         s, e = 0, len(DATA) - 1
         code = 200
@@ -35,8 +41,8 @@ class H(BaseHTTPRequestHandler):
         if code == 206: self.send_header("Content-Range", f"bytes {s}-{e}/{len(DATA)}")
         self.end_headers()
         try:
-            for i in range(0, len(body), 65536):
-                self.wfile.write(body[i:i + 65536]); time.sleep(0.002)
+            for i in range(0, len(body), pace[0]):
+                self.wfile.write(body[i:i + pace[0]]); time.sleep(pace[1])
         except Exception: pass
 
 
@@ -212,6 +218,34 @@ def main():
     time.sleep(0.9); assert pl2.id not in m.tasks, "induk kosong harus hilang otomatis"
     cfg["max_concurrent"] = 3
     print("OK playlist: induk+isi, nama kembar (1), agregasi status, jeda/lanjut massal, hapus, deteksi nama sama")
+
+    # --- 403: anti-hotlink & Range diblokir ---
+    h = m.add(base + "/hotlink", filename="hot.bin", referer="http://other.example/halaman")
+    assert wait(m, h.id, "completed"), (h.status, h.error); assert sha(h.final_path) == SHA
+    nr = m.add(base + "/norange403", filename="nr403.bin")
+    assert wait(m, nr.id, "completed"), (nr.status, nr.error); assert sha(nr.final_path) == SHA and not nr.resumable
+    print("OK 403 ditangani: anti-hotlink (Referer situs) & Range diblokir (unduh tanpa Range)")
+
+    # --- jalur alternatif ---
+    from swiftget.util import route_candidates, route_proxy, mask_proxy
+    assert route_candidates(cfg, base) == []                                   # nonaktif secara default
+    cfg["route_enabled"] = True; cfg["route_sites"] = "127.0.0.1"
+    cfg["route_proxies"] = "# komentar\ndirect\nsocks5://user:rahasia@10.0.0.1:1080"
+    assert route_candidates(cfg, base) == ["direct", "socks5://user:rahasia@10.0.0.1:1080"]
+    assert route_proxy(cfg, base, 0) == "" and route_proxy(cfg, base, 1).startswith("socks5") and route_proxy(cfg, base, 2) == ""
+    assert "rahasia" not in mask_proxy(route_proxy(cfg, base, 1)) and route_candidates(cfg, "http://lain.example/x") == []
+    cfg["route_proxies"] = "direct"
+    r0 = m.add(base + "/file", filename="route0.bin"); assert wait(m, r0.id, "completed") and sha(r0.final_path) == SHA
+    cfg["route_proxies"] = "http://127.0.0.1:9\ndirect"                        # jalur 1 = proxy mati
+    r1 = m.add(base + "/file", filename="route1.bin"); assert wait(m, r1.id, "completed", 40), (r1.status, r1.error)
+    assert r1.route_idx == 1 and sha(r1.final_path) == SHA
+    print("OK pindah jalur otomatis saat proxy mati (jalur ke-2 dipakai)")
+    cfg["route_proxies"] = "direct\ndirect"; cfg["route_slow_kbps"] = 100000; cfg["route_slow_secs"] = 1
+    r2 = m.add(base + "/slow", filename="route2.bin", connections=1)
+    assert wait(m, r2.id, "completed", 60), (r2.status, r2.error, r2.route_idx)
+    assert r2.route_idx >= 1 and sha(r2.final_path) == SHA, r2.route_idx
+    print("OK pindah jalur otomatis saat melambat, lanjut dari byte terakhir (indeks jalur =", r2.route_idx, ")")
+    cfg["route_enabled"] = False
 
     a = m.add(base + "/file", filename="rm.bin"); wait(m, a.id, "completed"); p = a.final_path
     m.remove(a.id, delete_file=True); time.sleep(0.5); assert not os.path.exists(p); print("OK hapus + file")

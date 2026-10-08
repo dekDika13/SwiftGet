@@ -73,6 +73,17 @@ Muncul peringatan dengan pilihan: **simpan dengan nomor** (`Judul (1)`), **ganti
 - Klik kanan unduhan: jeda/lanjutkan, naik/turun prioritas, **Properti** (ubah jumlah koneksi, folder tujuan, dan nama file, termasuk untuk unduhan yang gagal atau sudah selesai), unduh ulang, salin tautan, hapus.
 - Unduhan yang terputus bisa dilanjutkan (resume), bahkan setelah aplikasi ditutup. Ada batas kecepatan, jadwal mulai, dan verifikasi checksum.
 
+### Jalur alternatif untuk situs yang membatasi kecepatan (opsional, nonaktif secara default)
+Sebagian situs file hosting (misalnya MediaFire) menurunkan kecepatan per **alamat IP** setelah kamu mengunduh banyak, sehingga tinggal ±100 KB/s.
+Jika kamu punya proxy atau VPN sendiri (HTTP/HTTPS/SOCKS5), SwiftGet bisa mengirim unduhan situs tertentu lewat jalur itu:
+- Aktifkan di **Pengaturan › Jaringan › Jalur alternatif**, isi **Daftar jalur** (satu per baris; tulis `direct` untuk jalur tanpa proxy), dan **Situs yang memakai jalur**.
+- Bila unduhan terlalu lambat (batas bisa diatur) atau jalurnya gagal/diblokir, SwiftGet **pindah ke jalur berikutnya otomatis dan melanjutkan dari byte terakhir** (tanpa mengunduh ulang).
+- Tombol **Tes jalur** menampilkan alamat IP keluar tiap jalur.
+
+Yang perlu diketahui: SwiftGet **tidak menyediakan proxy** dan **tidak memalsukan identitas atau alamat IP**; batas dari situs tetap berlaku di jalur mana pun,
+dan file tetap harus melewati internetmu sehingga fitur ini **tidak menghemat bandwidth**. Mega tidak didukung (filenya terenkripsi dan kuotanya per IP).
+Pastikan pemakaiannya sesuai syarat layanan situs dan penyedia proxy/VPN-mu. Kalau yang kamu butuhkan hanya kecepatan, menunggu reset kuota, atau akun premium situs itu, tetap yang paling pasti.
+
 ### Berjalan di latar belakang & jalan otomatis saat login
 - Menutup jendela hanya menyembunyikannya ke system tray / menu bar; unduhan terus berjalan. Keluar sepenuhnya lewat menu tray › **Keluar**.
 - **Jalan otomatis saat login:** aktifkan di **Pengaturan › Umum › "Jalankan SwiftGet saat login"** (juga ditawarkan saat pertama kali dibuka dan di installer Windows).
@@ -99,6 +110,8 @@ Menggunakan extension:
 - **Unduhan biasa:** klik tautan unduhan seperti biasa, dan otomatis dialihkan ke SwiftGet.
 - **Video:** arahkan kursor ke video, klik tombol **Unduh** yang muncul; atau klik kanan halaman › *Unduh video halaman ini dengan SwiftGet*.
 - **Stream yang terdeteksi:** klik ikon extension untuk melihat daftar media di tab yang sedang dibuka.
+- **Gambar ("Save image as…") dibiarkan ditangani browser** agar tidak gagal di situs yang memblokir unduhan dari luar browser (mis. anti-hotlink WordPress). Bisa diaktifkan di Opsi extension.
+- **Dialog "Simpan sebagai…" bawaan browser** tidak diganggu: SwiftGet menunggu kamu memilih folder, lalu menyimpan ke folder pilihanmu.
 - Jika SwiftGet tidak berjalan, browser mengunduh seperti biasa (tidak ada yang rusak).
 
 ---
@@ -120,6 +133,7 @@ Menggunakan extension:
 - **Konten DRM** (Netflix, Disney+, Spotify, dll.) tidak bisa diunduh.
 - **Kecepatan** tidak bisa melebihi kecepatan internetmu; banyak koneksi hanya membantu jika server membatasi per koneksi.
 - **Google Drive:** pesan "kuota habis / too many users" adalah batas dari Google. Folder Drive belum didukung (unduh file satu per satu).
+- **HTTP 403 ("butuh login/izin"):** SwiftGet otomatis mencoba beberapa cara (tanpa header Range, Referer situs asal, header ala browser). Jika file memang butuh login, unduh lewat browser dengan extension aktif agar sesi login ikut terkirim.
 - **Belum didukung:** Mega, Terabox, torrent/magnet, FTP. Situs dengan captcha atau timer: unduh lewat browser dengan extension aktif (kamu menyelesaikan captcha, SwiftGet menangkap hasilnya).
 - **Firefox:** extension yang dipasang manual bersifat sementara dan hilang saat browser ditutup, kecuali versi yang sudah ditandatangani (dari toko Firefox).
 - **YouTube sering mengubah sistemnya.** Jika unduhan video gagal, perbarui yt-dlp di **Pengaturan › Video & Audio › Perbarui yt-dlp** atau pasang versi SwiftGet terbaru.
@@ -135,6 +149,9 @@ Menggunakan extension:
 | Extension: "Aplikasi tidak aktif" | Jalankan SwiftGet (atau aktifkan jalan otomatis saat login) |
 | Extension: "Belum terhubung" | Klik ikon extension › **Hubungkan ke SwiftGet**, lalu **Ya** di aplikasi |
 | Jendela tidak muncul setelah login | Itu normal (berjalan di latar belakang); klik ikon di system tray / menu bar |
+| Dialog "Simpan sebagai" di macOS macet | Perbaikan ada di versi terbaru (extension tidak lagi menyentuh unduhan sebelum folder dipilih). Pasang ulang/muat ulang extension dari folder `SwiftGet Extension` yang baru |
+| HTTP 403 pada gambar/file tertentu | Perbarui aplikasi dan extension; gambar kini ditangani browser secara default. Bila masih 403, file butuh login: unduh lewat browser |
+| Kecepatan turun jadi ±100 KB/s di MediaFire dsb. | Itu pembatasan per IP dari situs. Tunggu reset, gunakan akun premium, atau (opsional) pakai Jalur alternatif dengan proxy/VPN milikmu |
 | Port 6277 dipakai aplikasi lain | Ubah port di Pengaturan › Browser |
 
 Catatan pengembang, cara membangun, dan detail teknis ada di [`OWNER.md`](OWNER.md).

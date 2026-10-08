@@ -99,6 +99,13 @@ DEFAULTS = {
     "ffmpeg_path": "",
     "cookies_browser": "",
     "video_compat": True,      # True = H.264+AAC (bisa diputar di mana saja), False = kualitas asli VP9/AV1
+    # Jalur alternatif: kirim unduhan situs tertentu lewat proxy/VPN milik pengguna (nonaktif secara default)
+    "route_enabled": False,
+    "route_proxies": "",
+    "route_sites": "mediafire.com\npixeldrain.com\ngofile.io",
+    "route_auto": True,
+    "route_slow_kbps": 150,
+    "route_slow_secs": 20,
     "autostart": False,
     "paired_origins": [],
     "onboarded": False,

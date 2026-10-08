@@ -43,9 +43,10 @@ class Task:
     speed: float = field(default=0.0, repr=False)
     eta: float = field(default=-1.0, repr=False)
     note: str = field(default="", repr=False)
+    route_idx: int = field(default=0, repr=False)    # jalur (proxy) yang sedang dipakai
     n_items: int = field(default=0, repr=False)     # jumlah video (khusus induk playlist)
 
-    RUNTIME = ("speed", "eta", "note", "n_items")
+    RUNTIME = ("speed", "eta", "note", "n_items", "route_idx")
 
     def to_dict(self):
         d = asdict(self)

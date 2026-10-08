@@ -7,6 +7,34 @@ from urllib.parse import unquote, urlparse
 import requests
 
 
+def route_candidates(cfg, url) -> list:
+    """Daftar jalur (proxy) untuk URL ini, atau [] bila fitur jalur alternatif nonaktif / situsnya tidak termasuk."""
+    if not cfg["route_enabled"]:
+        return []
+    host = (urlparse(url).hostname or "").lower()
+    sites = [s.strip().lower() for s in re.split(r"[\s,]+", cfg["route_sites"]) if s.strip()]
+    if not any(host == s or host.endswith("." + s) for s in sites):
+        return []
+    return [ln.strip() for ln in cfg["route_proxies"].splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+
+def route_proxy(cfg, url, idx=0):
+    """Proxy untuk jalur ke-idx: None = fitur tidak berlaku, '' = langsung (direct), selain itu alamat proxy."""
+    c = route_candidates(cfg, url)
+    if not c:
+        return None
+    p = c[idx % len(c)]
+    return "" if p.lower() == "direct" else p
+
+
+def mask_proxy(p) -> str:
+    """Tampilkan jalur tanpa user:password."""
+    if not p:
+        return "langsung (tanpa proxy)"
+    u = urlparse(p)
+    return f"{u.scheme}://{u.hostname}:{u.port}" if u.hostname and u.port else (f"{u.scheme}://{u.hostname}" if u.hostname else "proxy")
+
+
 YT_RX = re.compile(r"(youtube\.com|youtu\.be|youtube-nocookie\.com)", re.I)
 
 
@@ -97,15 +125,21 @@ def unique_name(directory: str, name: str, reserved=()) -> str:
     return cand
 
 
+UNSAFE_HEADERS = {"host", "content-length", "range", "cookie", "connection", "transfer-encoding", "if-none-match",
+                  "if-modified-since", "if-range", "accept-encoding"}
+
+
 class Net:
     """Pembungkus requests dengan header, cookie, dan proxy bawaan."""
 
-    def __init__(self, cfg, referer="", cookies="", ua="", extra=None, keep_cookies=False):
+    def __init__(self, cfg, referer="", cookies="", ua="", extra=None, keep_cookies=False, proxy=None):
+        """proxy=None → pakai proxy global; proxy='' → tanpa proxy (jalur 'direct'); proxy='socks5://…' → proxy itu."""
         self.s = requests.Session()
         if not keep_cookies:
             self.s.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
-        if cfg["proxy"]:
-            self.s.proxies = {"http": cfg["proxy"], "https": cfg["proxy"]}
+        px = cfg["proxy"] if proxy is None else proxy
+        if px:
+            self.s.proxies = {"http": px, "https": px}
         self.timeout = cfg["timeout"]
         self.h = {"User-Agent": ua or cfg["user_agent"], "Accept": "*/*",
                   "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "identity"}
@@ -113,8 +147,9 @@ class Net:
             self.h["Referer"] = referer
         if cookies:
             self.h["Cookie"] = cookies
-        if extra:
-            self.h.update(extra)
+        for k, v in (extra or {}).items():            # header tambahan (resolver / tiruan header browser)
+            if isinstance(k, str) and isinstance(v, str) and k.lower() not in UNSAFE_HEADERS and len(v) < 4096:
+                self.h[k] = v
 
     def get(self, url, **kw):
         kw.setdefault("timeout", (10, self.timeout))

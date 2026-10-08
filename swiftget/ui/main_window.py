@@ -481,6 +481,7 @@ class MainWindow(QMainWindow):
                 menu.addAction("Properti: koneksi, lokasi, nama…", self.act_props)
         menu.addSeparator()
         menu.addAction("Salin tautan", lambda: self._copy("\n".join(x.url for x in s)))
+        menu.addAction("Buka tautan di browser", lambda: QDesktopServices.openUrl(QUrl(t.url)))
         menu.addSeparator()
         menu.addAction("Hapus…", self.act_remove)
         menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -724,7 +725,8 @@ class MainWindow(QMainWindow):
             return
         if route == "add" and not self.cfg["extension_ask"] and "\n" not in url:
             t = self.m.add(url, filename=data.get("filename", ""), referer=data.get("referer", ""),
-                           cookies=data.get("cookies", ""), user_agent=data.get("userAgent", ""))
+                           cookies=data.get("cookies", ""), user_agent=data.get("userAgent", ""), headers=data.get("headers") or {},
+                           save_dir=data.get("saveDir") or None)
             self.notify("Ditambahkan ke SwiftGet", t.name)
             return
         self.open_add(url, data)

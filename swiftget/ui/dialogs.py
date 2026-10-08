@@ -273,6 +273,9 @@ class AddDialog(QDialog):
         self.timer.timeout.connect(self._auto)
         self.url_edit.textChanged.connect(self.timer.start)
         self.dir_edit.setText(self.m.default_dir(""))
+        if self.payload.get("saveDir"):           # pengguna memilih folder sendiri di dialog "Simpan sebagai" browser
+            self.dir_edit.setText(self.payload["saveDir"])
+            self.custom_dir = True
         if urls:
             self.url_edit.setPlainText(urls)
 
@@ -449,7 +452,7 @@ class AddDialog(QDialog):
         self.stack.setCurrentIndex(BUSY)
         self.analysis = None
         th = Func(lambda: analyze(self.cfg, ls[0], p.get("referer", ""), p.get("cookies", ""), p.get("userAgent", ""),
-                                  p.get("alt") or ()))
+                                  p.get("alt") or (), p.get("headers") or {}))
         th.done.connect(lambda res, s=seq: self._result(res, s))
         th.start()
 
@@ -597,7 +600,7 @@ class AddDialog(QDialog):
         start_at = float(self.when.dateTime().toSecsSinceEpoch()) if self.sched.isChecked() else 0.0
         common = dict(save_dir=self.dir_edit.text() if self.custom_dir else None,
                       referer=p.get("referer", ""), cookies=p.get("cookies", ""), user_agent=p.get("userAgent", ""),
-                      start=start, start_at=start_at)
+                      headers=p.get("headers") or {}, start=start, start_at=start_at)
         if (a and a.kind == "media" and len(lines) == 1 and a.media.get("playlist")
                 and self.k_playlist.isChecked() and a.media["playlist"]["entries"]):
             return self._commit_playlist(common)
@@ -881,9 +884,17 @@ class SettingsDialog(QDialog):
             w.setValue(int(v))
         elif isinstance(w, QComboBox):
             w.setCurrentIndex(max(0, w.findData(v)))
+        elif isinstance(w, QPlainTextEdit):
+            w.setPlainText(str(v))
         else:
             w.setText(str(v))
         return w
+
+    def _text(self, key, form, label, placeholder=""):
+        w = QPlainTextEdit()
+        w.setFixedHeight(84)
+        w.setPlaceholderText(placeholder)
+        return self._reg(key, w, form, label)
 
     def _check(self, key, text, form):
         w = QCheckBox(text)
@@ -952,7 +963,51 @@ class SettingsDialog(QDialog):
         self._reg("user_agent", QLineEdit(), f, "User-Agent")
         self._spin("timeout", 5, 300, f, "Timeout", " detik")
         self._spin("retries", 0, 30, f, "Percobaan ulang")
+        sep = QLabel("Jalur alternatif per situs (opsional)")
+        sep.setStyleSheet("font-weight:700")
+        f.addRow("", sep)
+        f.addRow("", muted("Mengirim unduhan dari situs tertentu lewat proxy/VPN milik Anda sendiri, misalnya saat situs membatasi kecepatan "
+                           "per alamat IP. SwiftGet tidak menyediakan proxy dan tidak memalsukan identitas atau alamat IP; batas dari "
+                           "situs tetap berlaku di jalur mana pun. Trafik unduhan tetap melewati koneksi internet Anda "
+                           "(file harus sampai ke komputer ini), jadi fitur ini tidak menghemat bandwidth. Pastikan pemakaiannya sesuai "
+                           "syarat layanan situs dan proxy yang Anda pakai."))
+        self._check("route_enabled", "Aktifkan jalur alternatif (nonaktif secara default)", f)
+        self._text("route_proxies", f, "Daftar jalur", "satu per baris, dicoba berurutan:\ndirect\nsocks5://127.0.0.1:1080\nhttp://user:sandi@host:8080")
+        self._text("route_sites", f, "Situs yang memakai jalur", "mediafire.com\npixeldrain.com")
+        self._check("route_auto", "Pindah ke jalur berikutnya otomatis bila unduhan melambat atau jalur gagal", f)
+        self._spin("route_slow_kbps", 10, 100000, f, "Dianggap lambat bila di bawah", " KB/s")
+        self._spin("route_slow_secs", 5, 600, f, "selama", " detik")
+        bt = button("Tes jalur", None, "refresh")
+        bt.clicked.connect(self._test_routes)
+        self.route_out = muted()
+        self.route_out.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        f.addRow("", bt)
+        f.addRow("", self.route_out)
         return w
+
+    def _test_routes(self):
+        """Uji tiap jalur: ambil halaman trace Cloudflare lewat jalur itu dan tampilkan IP keluarnya."""
+        lines = [ln.strip() for ln in self.fields["route_proxies"].toPlainText().splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")] or ["direct"]
+        self.route_out.setText("Menguji…")
+
+        def job():
+            import time as _t
+            out = []
+            for p in lines:
+                px = None if p.lower() == "direct" else {"http": p, "https": p}
+                t0 = _t.time()
+                try:
+                    r = requests.get("https://www.cloudflare.com/cdn-cgi/trace", proxies=px or {}, timeout=12)
+                    ip = next((x[3:] for x in r.text.splitlines() if x.startswith("ip=")), "?")
+                    out.append(f"✓ {p if p.lower() == 'direct' else mask(p)}  →  IP keluar {ip}  ({int((_t.time() - t0) * 1000)} ms)")
+                except Exception as e:  # noqa
+                    out.append(f"✗ {p if p.lower() == 'direct' else mask(p)}  →  gagal: {str(e)[:80]}")
+            return "\n".join(out)
+        from ..util import mask_proxy as mask
+        th = Func(job)
+        th.done.connect(lambda r: isValid(self) and self.route_out.setText(str(r)))
+        th.start()
 
     def _tab_video(self):
         w, f = self._page()
@@ -1043,7 +1098,8 @@ class SettingsDialog(QDialog):
         old = (self.cfg["server_enabled"], self.cfg["server_port"], self.cfg["theme"], self.cfg["native_glass"])
         for k, w in self.fields.items():
             self.cfg[k] = (w.isChecked() if isinstance(w, QCheckBox) else w.value() if isinstance(w, QSpinBox)
-                           else w.currentData() if isinstance(w, QComboBox) else w.text().strip())
+                           else w.currentData() if isinstance(w, QComboBox)
+                           else w.toPlainText().strip() if isinstance(w, QPlainTextEdit) else w.text().strip())
         self.cfg.save()
         if not autostart.enable(bool(self.cfg["autostart"])):
             QMessageBox.warning(self, "Jalankan saat login", "Pengaturan 'jalankan saat login' gagal diterapkan di sistem ini.")

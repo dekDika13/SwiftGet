@@ -9,7 +9,7 @@ import requests
 from .config import categorize, data_dir
 from .models import Task
 from .resolvers import resolve
-from .util import Net, ensure_ext, filename_from_headers, filename_from_url, sanitize
+from .util import Net, ensure_ext, filename_from_headers, filename_from_url, mask_proxy, route_candidates, sanitize
 
 MB = 1024 * 1024
 
@@ -49,16 +49,24 @@ class RateLimiter:
             stop.wait(deficit / self.rate)
 
 
-def probe(net: Net, url: str) -> dict:
-    """Ambil metadata file: ukuran, dukungan resume, nama, tipe."""
-    r = net.get(url, headers={"Range": "bytes=0-0"}, stream=True)
+class HttpStatusError(DownloadError):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+
+
+RETRY_CODES = (400, 401, 403, 405, 406, 412)
+
+
+def _probe_once(net: Net, url: str, use_range: bool) -> dict:
+    r = net.get(url, headers={"Range": "bytes=0-0"} if use_range else {}, stream=True)
     try:
         code, h = r.status_code, r.headers
-        if code >= 400 and code != 416:
+        if code >= 400 and not (use_range and code == 416):
             hint = " (butuh login/izin)" if code in (401, 403) else ""
-            raise DownloadError(f"Server menjawab HTTP {code}{hint}")
+            raise HttpStatusError(code, f"Server menjawab HTTP {code}{hint}")
         total, resumable = 0, False
-        if code in (206, 416):
+        if use_range and code in (206, 416):
             m = re.search(r"/(\d+)\s*$", h.get("Content-Range", "")) or re.search(r"\*/(\d+)", h.get("Content-Range", ""))
             total = int(m.group(1)) if m else 0
             resumable = bool(total)
@@ -72,6 +80,34 @@ def probe(net: Net, url: str) -> dict:
         r.close()
 
 
+def probe(net: Net, url: str) -> dict:
+    """Ambil metadata file (ukuran, resume, nama, tipe). Bila ditolak (403 dll.) coba cara lain, seperti browser:
+    tanpa header Range, dengan Referer = situs asal, dengan header ala browser. Header yang berhasil dipakai seterusnya (net.h)."""
+    origin = "{0.scheme}://{0.netloc}/".format(urlparse(url))
+    like = {"Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", "Referer": origin,
+            "Sec-Fetch-Dest": "image", "Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Site": "same-origin"}
+    plans = [({}, True), ({}, False), ({"Referer": origin}, True), ({"Referer": origin}, False), (like, True), (like, False)]
+    base, seen, first = dict(net.h), set(), None
+    for upd, rng in plans:
+        merged = {**base, **upd}
+        key = (tuple(sorted(merged.items())), rng)
+        if key in seen:
+            continue
+        seen.add(key)
+        net.h.clear()
+        net.h.update(merged)
+        try:
+            return _probe_once(net, url, rng)
+        except HttpStatusError as e:
+            first = first or e
+            if e.code not in RETRY_CODES:
+                raise
+    net.h.clear()
+    net.h.update(base)
+    raise HttpStatusError(first.code, f"{first} — sudah dicoba dengan beberapa jenis header. "
+                                      "Coba buka tautan di browser (klik kanan › Buka tautan di browser).")
+
+
 class Job:
     def __init__(self, task: Task, cfg, limiter: RateLimiter, manager):
         self.t, self.cfg, self.limiter, self.mgr = task, cfg, limiter, manager
@@ -83,16 +119,34 @@ class Job:
         self.stop.set()
 
 
+def route_error(msg) -> "DownloadError":
+    e = DownloadError(msg)
+    e.route = True            # kegagalan koneksi: layak dicoba lewat jalur lain
+    return e
+
+
 class FileJob(Job):
     def run(self):
         t, cfg = self.t, self.cfg
         t.status, t.error, t.speed, t.eta, t.note = "preparing", "", 0, -1, "Menganalisis tautan…"
-        net0 = Net(cfg, t.referer, t.cookies, t.user_agent, t.headers, keep_cookies=True)
+        # --- jalur alternatif (opsional): proxy khusus untuk situs tertentu; resolve + unduh harus lewat IP yang sama
+        cands, proxy, self.route_note, self._slow_since = route_candidates(cfg, t.url), None, "", None
+        self.rotatable = False
+        if cands:
+            i = t.route_idx % len(cands)
+            proxy = "" if cands[i].lower() == "direct" else cands[i]
+            self.route_note = f"Jalur {i + 1}/{len(cands)}: {mask_proxy(proxy)}"
+            t.note = self.route_note
+            limit = int(cfg["speed_limit_kbps"])
+            self.rotatable = (len(cands) > 1 and bool(cfg["route_auto"]) and t.route_idx < len(cands) * 2 - 1
+                              and not (limit and limit <= int(cfg["route_slow_kbps"]) * 2))   # batas buatan sendiri ≠ dibatasi situs
+        net0 = Net(cfg, t.referer, t.cookies, t.user_agent, t.headers, keep_cookies=True, proxy=proxy)
         rv = resolve(net0, t.url)
         t.resolver = rv.resolver
         if self.stop.is_set():
             return
-        self.net = Net(cfg, rv.referer or t.referer, rv.cookies or t.cookies, t.user_agent, {**t.headers, **rv.headers})
+        self.net = Net(cfg, rv.referer or t.referer, rv.cookies or t.cookies, t.user_agent, {**t.headers, **rv.headers},
+                       proxy=proxy)
         p = probe(self.net, rv.url)
         if self.stop.is_set():
             return
@@ -126,7 +180,8 @@ class FileJob(Job):
                 if t.resumable and t.total > 0:
                     f.truncate(t.total)
 
-        t.status, t.note = "downloading", ""
+        t.status, t.note = "downloading", self.route_note
+        self._t0 = time.monotonic()
         self.lock, self.claimed, self.err = threading.Lock(), set(), None
         pending = sum(1 for c in t.chunks if c[1] < 0 or c[2] < c[1] - c[0] + 1)
         n = 1 if not t.resumable else max(1, min(int(t.connections), pending))
@@ -137,6 +192,7 @@ class FileJob(Job):
         while any(th.is_alive() for th in threads):
             time.sleep(0.4)
             self._tick(hist)
+            self._maybe_rotate()
         self._tick(hist)
         t.speed, t.eta = 0, -1
         if self.err:
@@ -171,6 +227,22 @@ class FileJob(Job):
         t.speed = (done - d0) / (now - t0) if now > t0 else 0
         t.downloaded = done
         t.eta = (t.total - done) / t.speed if t.speed > 1 and t.total > 0 else -1
+
+    def _maybe_rotate(self):
+        """Terlalu lambat cukup lama → hentikan; manager menjalankan lagi lewat jalur berikutnya (lanjut dari byte terakhir)."""
+        if not self.rotatable or self.stop.is_set():
+            return
+        t, cfg = self.t, self.cfg
+        now = time.monotonic()
+        secs = int(cfg["route_slow_secs"])
+        remaining = t.total - t.downloaded if t.total > 0 else 10 ** 9
+        if now - self._t0 < max(3, secs // 2) or remaining < MB or t.speed >= int(cfg["route_slow_kbps"]) * 1024:
+            self._slow_since = None
+            return
+        self._slow_since = self._slow_since or now
+        if now - self._slow_since >= secs:
+            t.note = "Terlalu lambat, pindah jalur…"
+            self.request_stop("rotate")
 
     def _verify(self):
         t = self.t
@@ -232,7 +304,7 @@ class FileJob(Job):
             except requests.RequestException as e:
                 attempts += 1
                 if attempts > self.cfg["retries"]:
-                    raise DownloadError(f"Koneksi gagal: {clean_error(e)}")
+                    raise route_error(f"Koneksi gagal: {clean_error(e)}")
             except OSError as e:
                 raise DownloadError("Disk penuh." if e.errno == errno.ENOSPC else f"Gagal menulis file: {e}")
             if attempts:

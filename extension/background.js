@@ -1,6 +1,6 @@
 // SwiftGet — background (Chrome/Edge/Brave/Opera/Vivaldi: service worker; Firefox: event page)
 const api = globalThis.browser ?? globalThis.chrome;
-const DEFAULTS = { port: 6277, token: "", intercept: true, minSizeMB: 0, excluded: "" };
+const DEFAULTS = { port: 6277, token: "", intercept: true, interceptImages: false, minSizeMB: 0, excluded: "" };
 const SESSION = api.storage.session ?? api.storage.local;
 
 async function cfg() { return { ...DEFAULTS, ...(await api.storage.local.get(DEFAULTS)) }; }
@@ -63,17 +63,54 @@ async function cookieHeader(url) {
 const basename = p => (p || "").split(/[\\/]/).pop();
 
 // ---- Ambil alih unduhan browser -------------------------------------------------
+const IMG_RX = /\.(jpe?g|png|gif|webp|avif|svg|bmp|ico|heic|tiff?)(\?|#|$)/i;
+const isImage = (u, mime) => /^image\//i.test(mime || "") || IMG_RX.test(u || "");
+const dirname = p => (p || "").replace(/[\\/][^\\/]*$/, "");
+
+// Menunggu browser menentukan nama/lokasi file. Jika dialog "Simpan sebagai…" sedang terbuka, JANGAN menjeda atau
+// membatalkan unduhan (itu membuat dialog bawaan macOS macet); tunggu sampai pengguna memilih lokasi.
+const waiters = new Map();
+api.downloads.onChanged.addListener((d) => {
+  const w = waiters.get(d.id);
+  if (!w) return;
+  if (d.filename?.current) { waiters.delete(d.id); w(d.filename.current); }
+  else if (d.state?.current && d.state.current !== "in_progress") { waiters.delete(d.id); w(""); }   // dialog dibatalkan
+});
+async function waitFilename(item, ms = 180000) {
+  const now = async () => (await api.downloads.search({ id: item.id }))[0];
+  let cur = await now();
+  if (!cur || cur.state !== "in_progress") return "";
+  if (cur.filename) return cur.filename;
+  return new Promise((res) => {
+    waiters.set(item.id, res);
+    now().then((c) => { if (c?.filename && waiters.delete(item.id)) res(c.filename); });   // tutup celah balapan
+    setTimeout(() => { if (waiters.delete(item.id)) res(""); }, ms);
+  });
+}
+async function activeTabUrl() {
+  try { const [t] = await api.tabs.query({ active: true, lastFocusedWindow: true }); return /^https?:/.test(t?.url || "") ? t.url : ""; }
+  catch { return ""; }
+}
+
 api.downloads.onCreated.addListener(async (item) => {
   const c = await cfg();
   const url = item.finalUrl || item.url;
   if (!c.intercept || !c.token || !/^https?:/i.test(url)) return;
   const host = new URL(url).hostname;
   if (c.excluded.split(/[\s,]+/).filter(Boolean).some(d => host === d || host.endsWith("." + d))) return;
+  if (isImage(url, item.mime) && !c.interceptImages) return;               // "Save image as…" tetap ditangani browser
   if (c.minSizeMB > 0 && item.fileSize > 0 && item.fileSize < c.minSizeMB * 1048576) return;
+  const t0 = Date.now();
+  const target = await waitFilename(item);
+  if (!target) return;                                                      // dialog dibatalkan / tak terjawab → biarkan browser
+  const waited = Date.now() - t0;
+  const [cur] = await api.downloads.search({ id: item.id });
+  if (!cur || cur.state !== "in_progress") return;                          // sudah selesai/gagal di browser → jangan digandakan
   try { await api.downloads.pause(item.id); } catch {}
   const res = await call("/add", {
-    url, referer: item.referrer || "", cookies: await cookieHeader(url), userAgent: navigator.userAgent,
-    filename: basename(item.filename), size: item.fileSize, mime: item.mime, source: "intercept",
+    url, referer: item.referrer || (await activeTabUrl()), cookies: await cookieHeader(url), userAgent: navigator.userAgent,
+    filename: basename(target), saveDir: waited > 1200 ? dirname(target) : "",   // lama menunggu = pengguna memilih folder sendiri
+    size: item.fileSize, mime: item.mime, source: "intercept",
   });
   if (res.ok) {
     try { await api.downloads.cancel(item.id); await api.downloads.erase({ id: item.id }); } catch {}

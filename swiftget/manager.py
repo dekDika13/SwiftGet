@@ -8,7 +8,9 @@ from pathlib import Path
 from .config import OTHER, categorize
 from .engine import FileJob, MediaJob, RateLimiter, clean_error
 from .models import ACTIVE, DB, Task
-from .util import is_youtube, sanitize, unique_name
+import requests
+
+from .util import is_youtube, route_candidates, sanitize, unique_name
 
 
 def _norm_url(u: str) -> str:
@@ -448,19 +450,33 @@ class Manager:
             if t.status == "completed" and not t.parent_id:
                 self._emit("completed", t.id)
         except Exception as e:
-            if job.reason not in ("pause", "cancel"):
-                t.status, t.error = "error", clean_error(e)
-                if not t.parent_id:
-                    self._emit("error", t.id)
+            if job.reason not in ("pause", "cancel", "rotate"):
+                if self._should_rotate(t, e):                 # jalur ini diblokir/gagal → coba jalur berikutnya
+                    t.route_idx += 1
+                    t.status, t.error, t.note = "queued", "", "Jalur gagal, pindah jalur…"
+                else:
+                    t.status, t.error = "error", clean_error(e)
+                    if not t.parent_id:
+                        self._emit("error", t.id)
         finally:
             t.speed, t.eta = 0, -1
             with self.lock:
                 self.jobs.pop(t.id, None)
                 self.threads.pop(t.id, None)
-                if t.status in ACTIVE:
+                if job.reason == "rotate" and t.status in ACTIVE:
+                    t.route_idx += 1
+                    t.status = "queued"
+                elif t.status in ACTIVE:
                     t.status = "paused"
             if t.id in self.tasks:
                 self.db.update(t)
+
+    def _should_rotate(self, t: Task, e: Exception) -> bool:
+        c = route_candidates(self.cfg, t.url)
+        if len(c) < 2 or not self.cfg["route_auto"] or t.route_idx >= len(c) * 2 - 1:
+            return False
+        return (isinstance(e, requests.RequestException) or getattr(e, "route", False)
+                or getattr(e, "code", 0) in (403, 429, 503))
 
     def _loop(self):
         last_save = 0.0

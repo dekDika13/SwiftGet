@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swiftget"
-version = "1.2.0"                    # <<< SATU-SATUNYA tempat versi. Ubah angka ini untuk merilis versi baru.
+version = "1.2.1"                    # <<< SATU-SATUNYA tempat versi. Ubah angka ini untuk merilis versi baru.
 description = "Download manager lintas platform dengan extension browser, pengunduh video, dan manajemen hasil unduhan"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,7 +22,7 @@ classifiers = [
 ]
 dependencies = [                     # dipasang otomatis oleh: pip install -e .
     "PySide6>=6.6",
-    "requests>=2.31",
+    "requests[socks]>=2.31",       # [socks] = dukungan proxy SOCKS5
     "yt-dlp[default]",
     "imageio-ffmpeg>=0.5",           # FFmpeg bawaan lewat pip, tanpa Homebrew
 ]

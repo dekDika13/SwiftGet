@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 from .config import ALL_EXTS, categorize
 from .engine import clean_error, drop_cookie_file, ffmpeg_path, probe, ytdlp_base
 from .resolvers import ResolveError, resolve
-from .util import Net, ensure_ext, filename_from_url, is_youtube, sanitize
+from .util import Net, ensure_ext, filename_from_url, is_youtube, route_proxy, sanitize
 
 MEDIA_HOSTS = re.compile(r"(youtube\.com|youtu\.be|vimeo\.com|tiktok\.com|twitter\.com|//x\.com|instagram\.com|facebook\.com|"
                          r"fb\.watch|dailymotion\.com|twitch\.tv|soundcloud\.com|bilibili\.com|reddit\.com|streamable\.com)", re.I)
@@ -29,17 +29,17 @@ class Analysis:
     links: list = field(default_factory=list)
 
 
-def analyze(cfg, url, referer="", cookies="", ua="", alt=()) -> Analysis:
+def analyze(cfg, url, referer="", cookies="", ua="", alt=(), headers=None) -> Analysis:
     last = None
     for u in [url, *alt]:
-        a = _analyze(cfg, u, referer, cookies, ua)
+        a = _analyze(cfg, u, referer, cookies, ua, headers or {})
         if a.kind in ("file", "media", "links"):
             return a
         last = a if last is None or a.kind == "error" else last
     return last
 
 
-def _analyze(cfg, url, referer, cookies, ua) -> Analysis:
+def _analyze(cfg, url, referer, cookies, ua, headers=None) -> Analysis:
     url = url.strip()
     if not re.match(r"https?://", url, re.I):
         return Analysis(kind="error", url=url, message="URL harus diawali http:// atau https://")
@@ -52,14 +52,15 @@ def _analyze(cfg, url, referer, cookies, ua) -> Analysis:
             return Analysis(kind="media", url=url, media=info, referer=referer, cookies=cookies)
         if MEDIA_HOSTS.search(url):
             return Analysis(kind="error", url=url, message=err or "Media tidak dapat dianalisis.")
-    net = Net(cfg, referer, cookies, ua, keep_cookies=True)
+    px = route_proxy(cfg, url)                 # None bila jalur alternatif tidak berlaku untuk situs ini
+    net = Net(cfg, referer, cookies, ua, headers, keep_cookies=True, proxy=px)
     try:
         rv = resolve(net, url)
     except ResolveError as e:
         return Analysis(kind="error", url=url, message=str(e))
     except Exception as e:
         return Analysis(kind="error", url=url, message=f"Gagal menghubungi server: {clean_error(e)}")
-    net2 = Net(cfg, rv.referer or referer, rv.cookies or cookies, ua, rv.headers)
+    net2 = Net(cfg, rv.referer or referer, rv.cookies or cookies, ua, {**(headers or {}), **rv.headers}, proxy=px)
     try:
         p = probe(net2, rv.url)
     except Exception as e:
